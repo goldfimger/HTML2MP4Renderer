@@ -64,11 +64,13 @@ class RenderForegroundService : Service() {
             }
 
             ACTION_START_RENDER -> {
-                val request = pendingRequest ?: run {
+                val request = pendingRequest
+                startAsMediaProcessingForeground()
+                if (request == null) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
                     stopSelf()
                     return START_NOT_STICKY
                 }
-                startAsMediaProcessingForeground()
                 launchRenderJob(request)
             }
         }
@@ -81,16 +83,26 @@ class RenderForegroundService : Service() {
             eta = "--:--",
             phase = "Menyiapkan Hardware MediaCodec Exynos 850..."
         )
-        ServiceCompat.startForeground(
-            this,
-            NOTIFICATION_ID,
-            notification,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
-            } else {
-                0
-            }
-        )
+        val fgsType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
+        } else {
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+        }
+        try {
+            ServiceCompat.startForeground(
+                this,
+                NOTIFICATION_ID,
+                notification,
+                fgsType
+            )
+        } catch (_: Throwable) {
+            ServiceCompat.startForeground(
+                this,
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            )
+        }
     }
 
     private fun launchRenderJob(request: RenderJobRequest) {

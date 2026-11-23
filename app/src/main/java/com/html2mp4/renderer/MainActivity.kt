@@ -134,7 +134,7 @@ class MainActivity : ComponentActivity() {
                         if (selectedTab == 0) {
                             ProjectScreen(
                                 metadata = metadata,
-                                isProbingDuration = isProbingDuration,
+                                isProbingDuration = isProbing,
                                 config = config,
                                 renderStatus = renderStatus,
                                 onPickHtmlFile = {

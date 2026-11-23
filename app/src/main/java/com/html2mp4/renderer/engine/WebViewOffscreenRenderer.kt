@@ -259,7 +259,10 @@ class WebViewOffscreenRenderer(
             }
 
             withTimeoutOrNull(12_000L) { pageLoaded.await() }
-            delay(300L)
+            delay(120L)
+
+            bridge.audioChunkQueue.clear()
+            bridge.isCapturingAudio = !config.isAudioMuted
 
             withContext(Dispatchers.Main) {
                 val bootstrap = HtmlBridge.buildBootstrapScript(
@@ -268,15 +271,18 @@ class WebViewOffscreenRenderer(
                     captureAudio = !config.isAudioMuted
                 )
                 webView?.evaluateJavascript(
-                    "$bootstrap; window.__html2mp4StartPlayback();",
+                    "$bootstrap; if (window.__html2mp4PrepareAndStart) { window.__html2mp4PrepareAndStart(); } else { window.__html2mp4StartPlayback(); if (window.AndroidHtml2Mp4) window.AndroidHtml2Mp4.onPlaybackStarted(); }",
                     null
                 )
             }
 
-            bridge.isCapturingAudio = !config.isAudioMuted
+            // Wait until HTML fonts finish loading, media resets to 0.00s, and Frame 0 playback starts
+            withTimeoutOrNull(3_000L) { bridge.playbackStartedDeferred.await() }
+
             val frameDurationMs = (1000L / fps).coerceAtLeast(16L)
             val startWallMs = System.currentTimeMillis()
             val silenceFrameBytes = ByteArray((config.audioSampleRate.hz / fps) * 2 * config.audioChannels.count)
+            var hasReceivedRealAudio = false
             var frameIdx = 0
 
             while (coroutineContext.isActive) {
@@ -312,12 +318,17 @@ class WebViewOffscreenRenderer(
                 if (!config.isAudioMuted) {
                     while (true) {
                         val chunk = bridge.audioChunkQueue.poll() ?: break
+                        hasReceivedRealAudio = true
                         pipeline.feedAudioPcm(chunk.pcmBytes)
                     }
-                    var padGuard = 0
-                    while (pipeline.audioWrittenDurationMs() + 25L < afterFrameElapsedMs && padGuard < 4) {
-                        pipeline.feedAudioPcm(silenceFrameBytes)
-                        padGuard++
+                    // Never inject synthetic silence gaps into an active live audio stream (causes stuttering).
+                    // Only keep track alive with silence if the page genuinely produces zero audio.
+                    if (!hasReceivedRealAudio && afterFrameElapsedMs > 1_000L) {
+                        var padGuard = 0
+                        while (pipeline.audioWrittenDurationMs() + 400L < afterFrameElapsedMs && padGuard < 4) {
+                            pipeline.feedAudioPcm(silenceFrameBytes)
+                            padGuard++
+                        }
                     }
                 }
 
@@ -342,6 +353,20 @@ class WebViewOffscreenRenderer(
                             phaseLabel = "Encoding Frame $frameIdx (~$totalFrames)"
                         )
                     )
+                }
+            }
+
+            if (!config.isAudioMuted) {
+                // Allow the final ScriptProcessor audio callback (~85ms window) to cross the JS bridge
+                delay(90L)
+                while (true) {
+                    val chunk = bridge.audioChunkQueue.poll() ?: break
+                    pipeline.feedAudioPcm(chunk.pcmBytes)
+                }
+                var endPadGuard = 0
+                while (pipeline.audioWrittenDurationMs() + 60L < durationMs && endPadGuard < 32) {
+                    pipeline.feedAudioPcm(silenceFrameBytes)
+                    endPadGuard++
                 }
             }
 

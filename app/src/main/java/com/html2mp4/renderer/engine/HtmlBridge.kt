@@ -29,10 +29,18 @@ class HtmlBridge(
     private val targetChannels: Int
 ) {
     val probeDeferred = CompletableDeferred<HtmlProbeResult>()
+    val playbackStartedDeferred = CompletableDeferred<Unit>()
     val audioChunkQueue = ConcurrentLinkedQueue<AudioPcmChunk>()
 
     @Volatile
     var isCapturingAudio: Boolean = false
+
+    @JavascriptInterface
+    fun onPlaybackStarted() {
+        if (!playbackStartedDeferred.isCompleted) {
+            playbackStartedDeferred.complete(Unit)
+        }
+    }
 
     @JavascriptInterface
     fun onMetadataDetected(durationMs: Long, width: Int, height: Int) {
@@ -60,8 +68,8 @@ class HtmlBridge(
     @JavascriptInterface
     fun onAudioPcmChunk(base64Int16Pcm: String, sampleRate: Int, channels: Int, ptsMs: Long) {
         if (!isCapturingAudio || base64Int16Pcm.isEmpty()) return
-        // Bound queue size strictly to avoid heap growth on Exynos 850
-        if (audioChunkQueue.size > 160) {
+        // Large bounded queue prevents dropping audio bursts during heavy SVG/Canvas frame draws
+        while (audioChunkQueue.size >= 512) {
             audioChunkQueue.poll()
         }
         runCatching {
@@ -311,10 +319,36 @@ class HtmlBridge(
             (function() {
               if (window.__html2mp4Bootstrapped) return;
               window.__html2mp4Bootstrapped = true;
+              window.__html2mp4Active = false;
 
               const TARGET_SR = $sampleRate;
               const TARGET_CH = $channels;
               const CAPTURE_AUDIO = $captureAudio;
+              const pendingMediaPlays = new Set();
+
+              // Gate early HTMLMediaElement.play() calls so audio/video waits cleanly at t=0
+              // until MediaCodec + audio bridge are armed and startWallMs begins.
+              const proto = window.HTMLMediaElement && window.HTMLMediaElement.prototype;
+              const origMediaPlay = proto ? proto.play : null;
+              if (proto && origMediaPlay) {
+                proto.play = function() {
+                  if (window.__html2mp4Active) {
+                    return origMediaPlay.apply(this, arguments);
+                  }
+                  pendingMediaPlays.add(this);
+                  try {
+                    this.pause();
+                    if (isFinite(this.currentTime) && this.currentTime > 0) {
+                      this.currentTime = 0;
+                    }
+                  } catch (e) {}
+                  try {
+                    return Promise.reject(new DOMException('Deferred until capture start', 'NotAllowedError'));
+                  } catch (e) {
+                    return Promise.reject(new Error('Deferred until capture start'));
+                  }
+                };
+              }
 
               function arrayBufferToBase64(buffer) {
                 const bytes = new Uint8Array(buffer);
@@ -326,6 +360,7 @@ class HtmlBridge(
                 return btoa(binary);
               }
 
+              const allContexts = [];
               if (CAPTURE_AUDIO && (window.AudioContext || window.webkitAudioContext)) {
                 const NativeCtx = window.AudioContext || window.webkitAudioContext;
                 const hookedContexts = new Set();
@@ -334,9 +369,11 @@ class HtmlBridge(
                 function attachTap(ctx) {
                   if (!ctx || hookedContexts.has(ctx)) return;
                   hookedContexts.add(ctx);
+                  allContexts.push(ctx);
                   try {
                     const tapGain = ctx.createGain();
-                    const processor = ctx.createScriptProcessor(2048, TARGET_CH, TARGET_CH);
+                    // 4096 buffer gives Chromium main thread 2x headroom (~85ms) preventing SVG/DOM underrun crackle
+                    const processor = ctx.createScriptProcessor(4096, TARGET_CH, TARGET_CH);
                     const silentOut = ctx.createGain();
                     silentOut.gain.value = 0.0;
                     silentOut.__isHtml2Mp4Silent = true;
@@ -347,22 +384,38 @@ class HtmlBridge(
                       const srcRate = ctx.sampleRate || TARGET_SR;
                       const inLen = ev.inputBuffer.length;
                       const chCount = Math.min(TARGET_CH, ev.inputBuffer.numberOfChannels);
-                      const ratio = srcRate / TARGET_SR;
-                      const outLen = Math.max(1, Math.round(inLen / ratio));
-                      const int16 = new Int16Array(outLen * TARGET_CH);
-                      for (let i = 0; i < outLen; i++) {
-                        const srcPos = Math.min(inLen - 1, i * ratio);
-                        const idx0 = Math.floor(srcPos);
-                        const idx1 = Math.min(inLen - 1, idx0 + 1);
-                        const frac = srcPos - idx0;
+                      let int16;
+
+                      if (srcRate === TARGET_SR) {
+                        int16 = new Int16Array(inLen * TARGET_CH);
                         for (let c = 0; c < TARGET_CH; c++) {
                           const srcCh = c < chCount ? c : 0;
                           const chData = ev.inputBuffer.getChannelData(srcCh);
-                          const sample = chData[idx0] * (1 - frac) + chData[idx1] * frac;
-                          const clamped = Math.max(-1, Math.min(1, sample));
-                          int16[i * TARGET_CH + c] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7FFF;
+                          for (let i = 0; i < inLen; i++) {
+                            const s = chData[i];
+                            const clamped = s > 1 ? 1 : (s < -1 ? -1 : s);
+                            int16[i * TARGET_CH + c] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7FFF;
+                          }
+                        }
+                      } else {
+                        const ratio = srcRate / TARGET_SR;
+                        const outLen = Math.max(1, Math.round(inLen / ratio));
+                        int16 = new Int16Array(outLen * TARGET_CH);
+                        for (let c = 0; c < TARGET_CH; c++) {
+                          const srcCh = c < chCount ? c : 0;
+                          const chData = ev.inputBuffer.getChannelData(srcCh);
+                          for (let i = 0; i < outLen; i++) {
+                            const srcPos = Math.min(inLen - 1, i * ratio);
+                            const idx0 = Math.floor(srcPos);
+                            const idx1 = Math.min(inLen - 1, idx0 + 1);
+                            const frac = srcPos - idx0;
+                            const s = chData[idx0] * (1 - frac) + chData[idx1] * frac;
+                            const clamped = s > 1 ? 1 : (s < -1 ? -1 : s);
+                            int16[i * TARGET_CH + c] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7FFF;
+                          }
                         }
                       }
+
                       const ptsMs = Math.max(0, Math.round(performance.now() - startWall));
                       if (window.AndroidHtml2Mp4) {
                         window.AndroidHtml2Mp4.onAudioPcmChunk(
@@ -401,10 +454,10 @@ class HtmlBridge(
                   if (!mediaEls.length) return;
                   const sharedCtx = window.__html2mp4SharedCtx || new NativeCtx({ sampleRate: TARGET_SR });
                   window.__html2mp4SharedCtx = sharedCtx;
+                  attachTap(sharedCtx);
                   if (sharedCtx.state === 'suspended') {
                     sharedCtx.resume().catch(() => {});
                   }
-                  attachTap(sharedCtx);
                   mediaEls.forEach((el) => {
                     if (hookedElements.has(el)) return;
                     hookedElements.add(el);
@@ -417,15 +470,50 @@ class HtmlBridge(
               }
 
               window.__html2mp4StartPlayback = function() {
+                if (proto && origMediaPlay) {
+                  proto.play = origMediaPlay;
+                }
                 window.__html2mp4Active = true;
+
                 if (window.__html2mp4HookMediaElements) window.__html2mp4HookMediaElements();
-                document.querySelectorAll('video, audio').forEach((el) => {
+                allContexts.forEach((c) => {
                   try {
-                    el.currentTime = 0;
-                    el.muted = !CAPTURE_AUDIO;
-                    el.play().catch(() => {});
+                    if (c.state === 'suspended') c.resume().catch(() => {});
                   } catch (e) {}
                 });
+
+                const allMedia = new Set(document.querySelectorAll('video, audio'));
+                pendingMediaPlays.forEach((el) => allMedia.add(el));
+                allMedia.forEach((el) => {
+                  try {
+                    el.pause();
+                    el.currentTime = 0;
+                    el.muted = !CAPTURE_AUDIO;
+                  } catch (e) {}
+                });
+
+                try {
+                  if (document.getAnimations) {
+                    document.getAnimations().forEach((anim) => {
+                      try {
+                        anim.currentTime = 0;
+                        anim.play();
+                      } catch (e) {}
+                    });
+                  }
+                } catch (e) {}
+
+                try {
+                  if (window.OPENER && window.OPENER.tl) {
+                    if (typeof window.OPENER.tl.pause === 'function') {
+                      window.OPENER.tl.pause(0, false);
+                    }
+                    if (typeof window.OPENER.tl.play === 'function') {
+                      window.OPENER.tl.play(0);
+                    }
+                  }
+                } catch (e) {}
+
                 try {
                   window.dispatchEvent(new Event('pointerdown'));
                   if (document.body) {
@@ -433,13 +521,32 @@ class HtmlBridge(
                     document.body.click();
                   }
                 } catch (e) {}
-                try {
-                  if (window.OPENER && window.OPENER.tl && typeof window.OPENER.tl.play === 'function') {
-                    if (window.OPENER.tl.paused()) {
-                      window.OPENER.tl.play(0);
+
+                allMedia.forEach((el) => {
+                  try {
+                    if (el.paused) {
+                      el.currentTime = 0;
+                      el.play().catch(() => {});
                     }
-                  }
-                } catch (e) {}
+                  } catch (e) {}
+                });
+              };
+
+              window.__html2mp4PrepareAndStart = function() {
+                const fontsPromise = (document.fonts && document.fonts.ready)
+                  ? document.fonts.ready.catch(() => {})
+                  : Promise.resolve();
+                fontsPromise.then(function() {
+                  // Yield 1 micro-tick so any listener registered in document.fonts.ready runs first
+                  setTimeout(function() {
+                    window.__html2mp4StartPlayback();
+                    requestAnimationFrame(function() {
+                      if (window.AndroidHtml2Mp4 && window.AndroidHtml2Mp4.onPlaybackStarted) {
+                        window.AndroidHtml2Mp4.onPlaybackStarted();
+                      }
+                    });
+                  }, 16);
+                });
               };
             })();
         """.trimIndent()

@@ -47,7 +47,7 @@ class MediaCodecMuxerPipeline(
     )
 
     private val expectAudioTrack = !config.isAudioMuted
-    private val pendingSamples = ArrayList<PendingMuxSample>(32)
+    private val pendingSamples = ArrayList<PendingMuxSample>(128)
     private var totalAudioSamplesWritten = 0L
     private var firstRawVideoPtsUs = -1L
     private var lastVideoPtsUs = -1L
@@ -78,7 +78,7 @@ class MediaCodecMuxerPipeline(
                     )
                 }
                 setInteger(MediaFormat.KEY_BIT_RATE, config.audioBitrate.kbps * 1000)
-                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 32 * 1024)
+                setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 64 * 1024)
             }
 
             audioCodec = MediaCodec.createEncoderByType(resolvedAudioMime).apply {
@@ -89,7 +89,7 @@ class MediaCodecMuxerPipeline(
 
         muxer = MediaMuxer(tempOutputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
 
-        // Seed 1 tiny silence frame early so audioTrackIndex registers alongside videoTrackIndex
+        // Seed 1 tiny silence frame (~21ms) so audioTrackIndex initializes alongside videoTrackIndex
         if (expectAudioTrack) {
             val warmupSilence = ByteArray(1024 * 2 * config.audioChannels.count)
             feedAudioPcm(warmupSilence)
@@ -206,7 +206,7 @@ class MediaCodecMuxerPipeline(
                                 if (muxerStarted) {
                                     videoBufferInfo.presentationTimeUs = normalizedPtsUs
                                     muxer!!.writeSampleData(videoTrackIndex, encodedData, videoBufferInfo)
-                                } else if (pendingSamples.size < 96) {
+                                } else if (pendingSamples.size < 512) {
                                     val copy = ByteArray(videoBufferInfo.size)
                                     encodedData.get(copy)
                                     val infoCopy = MediaCodec.BufferInfo().apply {
@@ -226,9 +226,10 @@ class MediaCodecMuxerPipeline(
 
     fun feedAudioPcm(pcmBytes: ByteArray) {
         val codec = audioCodec ?: return
+        val bytesPerSampleFrame = 2 * config.audioChannels.count
         var offset = 0
         var retries = 0
-        while (offset < pcmBytes.size && retries < 24) {
+        while (offset + bytesPerSampleFrame <= pcmBytes.size && retries < 24) {
             val inIdx = codec.dequeueInputBuffer(4_000L)
             if (inIdx < 0) {
                 drainAudio(endOfStream = false)
@@ -238,11 +239,11 @@ class MediaCodecMuxerPipeline(
             retries = 0
             val buf = codec.getInputBuffer(inIdx) ?: break
             buf.clear()
-            val toCopy = minOf(buf.remaining(), pcmBytes.size - offset)
+            val rawCopy = minOf(buf.remaining(), pcmBytes.size - offset)
+            val toCopy = (rawCopy / bytesPerSampleFrame) * bytesPerSampleFrame
             if (toCopy <= 0) break
             buf.put(pcmBytes, offset, toCopy)
 
-            val bytesPerSampleFrame = 2 * config.audioChannels.count
             val framesInChunk = toCopy / bytesPerSampleFrame
             val ptsUs = (totalAudioSamplesWritten * 1_000_000L) / config.audioSampleRate.hz
             totalAudioSamplesWritten += framesInChunk
@@ -299,7 +300,7 @@ class MediaCodecMuxerPipeline(
                                 if (muxerStarted) {
                                     audioBufferInfo.presentationTimeUs = normalizedAudioPtsUs
                                     muxer!!.writeSampleData(audioTrackIndex, encodedData, audioBufferInfo)
-                                } else if (pendingSamples.size < 96) {
+                                } else if (pendingSamples.size < 512) {
                                     val copy = ByteArray(audioBufferInfo.size)
                                     encodedData.get(copy)
                                     val infoCopy = MediaCodec.BufferInfo().apply {

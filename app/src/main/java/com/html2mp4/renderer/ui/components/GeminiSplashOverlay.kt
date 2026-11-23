@@ -57,7 +57,7 @@ fun GeminiSplashOverlay(
 
     LaunchedEffect(Unit) {
         animateIn = true
-        delay(1750L)
+        delay(2900L)
         visible = false
         delay(380L)
         onFinished()

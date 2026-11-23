@@ -1,18 +1,28 @@
 package com.html2mp4.renderer.engine
 
 import android.annotation.SuppressLint
+import android.app.Presentation
 import android.content.Context
-import android.graphics.HardwareRenderer
-import android.graphics.RenderNode
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.SurfaceTexture
+import android.hardware.display.DisplayManager
+import android.hardware.display.VirtualDisplay
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
+import android.view.Surface
 import android.view.View
+import android.view.ViewGroup
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.FrameLayout
+import androidx.webkit.WebViewCompat
+import androidx.webkit.WebViewFeature
 import com.html2mp4.renderer.model.RenderConfig
 import com.html2mp4.renderer.util.MemoryGuard
 import kotlinx.coroutines.CompletableDeferred
@@ -28,8 +38,14 @@ import kotlin.math.ceil
 import kotlin.math.roundToInt
 
 /**
- * Renders HTML offscreen using hardware-accelerated WebView + API 29 HardwareRenderer
- * directly into MediaCodec's InputSurface, keeping JVM heap usage minimal on Exynos 850.
+ * Crash-proof offscreen WebView -> MediaCodec Surface renderer for Android 15 (Exynos 850).
+ *
+ * 1. During HTML import (inspectDurationOnly), WebView is muted at Chromium level + JS AudioContext
+ *    is suspended so zero sound leaks from the speaker.
+ * 2. During rendering, attempts VirtualDisplay + Presentation (real hardware-accelerated Window).
+ *    If OEM/AOSP blocks Presentation from a Service, automatically falls back to LAYER_TYPE_SOFTWARE
+ *    with a single reusable Bitmap drawn onto MediaCodec.inputSurface.lockCanvas() — eliminating
+ *    unattached-WebView RenderThread SIGSEGV crashes.
  */
 class WebViewOffscreenRenderer(
     private val context: Context,
@@ -45,7 +61,7 @@ class WebViewOffscreenRenderer(
     )
 
     @SuppressLint("SetJavaScriptEnabled")
-    suspend fun inspectDurationOnly(htmlUri: Uri, assetsTreeUri: Uri?): Long {
+    suspend fun inspectProjectMetadata(htmlUri: Uri, assetsTreeUri: Uri?): HtmlProbeResult {
         val bridge = HtmlBridge(48000, 2)
         val resourceHandler = SafWebResourceHandler(context, htmlUri, assetsTreeUri)
         val pageLoaded = CompletableDeferred<Unit>()
@@ -53,20 +69,40 @@ class WebViewOffscreenRenderer(
 
         return try {
             withContext(Dispatchers.Main) {
-                webView = createConfiguredWebView(bridge, resourceHandler) {
+                webView = createConfiguredWebView(
+                    hostContext = context,
+                    bridge = bridge,
+                    resourceHandler = resourceHandler,
+                    hardwareLayer = false,
+                    muteAudioAtBrowser = true,
+                    requireUserGesture = true,
+                    documentStartScript = HtmlBridge.buildProbeOnlyScript()
+                ) {
                     if (!pageLoaded.isCompleted) pageLoaded.complete(Unit)
+                }.apply {
+                    // Neutral 1000x1000 square viewport prevents biasing responsive CSS toward landscape or portrait
+                    measure(
+                        View.MeasureSpec.makeMeasureSpec(1000, View.MeasureSpec.EXACTLY),
+                        View.MeasureSpec.makeMeasureSpec(1000, View.MeasureSpec.EXACTLY)
+                    )
+                    layout(0, 0, 1000, 1000)
+                    loadUrl(SafWebResourceHandler.ENTRY_URL)
                 }
-                webView?.layout(0, 0, 1280, 720)
-                webView?.loadUrl(SafWebResourceHandler.ENTRY_URL)
             }
 
             withTimeoutOrNull(8_000L) { pageLoaded.await() }
-            delay(400L)
+            delay(350L)
             withContext(Dispatchers.Main) {
-                val script = HtmlBridge.buildBootstrapScript(48000, 2, captureAudio = false)
-                webView?.evaluateJavascript(script + "; window.__html2mp4DetectDuration();", null)
+                val probeCall = "${HtmlBridge.buildProbeOnlyScript()}; window.__html2mp4ProbeNow();"
+                webView?.evaluateJavascript(probeCall, null)
             }
-            withTimeoutOrNull(3_500L) { bridge.durationDeferred.await() } ?: 10_000L
+            withTimeoutOrNull(3_500L) { bridge.probeDeferred.await() }
+                ?: HtmlProbeResult(
+                    durationMs = 10_000L,
+                    width = 1280,
+                    height = 720,
+                    orientation = com.html2mp4.renderer.model.VideoOrientation.LANDSCAPE
+                )
         } finally {
             withContext(Dispatchers.Main) {
                 destroyWebViewSafely(webView)
@@ -94,31 +130,109 @@ class WebViewOffscreenRenderer(
         val pageLoaded = CompletableDeferred<Unit>()
 
         var webView: WebView? = null
-        var hardwareRenderer: HardwareRenderer? = null
-        var renderNode: RenderNode? = null
+        var virtualDisplay: VirtualDisplay? = null
+        var presentation: Presentation? = null
+        var reusableBitmap: Bitmap? = null
+        var bitmapCanvas: Canvas? = null
+        var usingPresentation = false
 
         try {
             pipeline.prepare()
 
             withContext(Dispatchers.Main) {
-                webView = createConfiguredWebView(bridge, resourceHandler) {
-                    if (!pageLoaded.isCompleted) pageLoaded.complete(Unit)
-                }.apply {
-                    measure(
-                        View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
-                        View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY)
+                val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
+                val densityDpi = context.resources.displayMetrics.densityDpi
+                val probeTex = SurfaceTexture(0).apply { setDefaultBufferSize(width, height) }
+                val probeSurface = Surface(probeTex)
+
+                val vdAttempt = runCatching {
+                    dm.createVirtualDisplay(
+                        "HTML2MP4_Offscreen",
+                        width,
+                        height,
+                        densityDpi,
+                        probeSurface,
+                        DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or
+                            DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION
                     )
-                    layout(0, 0, width, height)
+                }.getOrNull()
+
+                val docStartBootstrap = HtmlBridge.buildBootstrapScript(
+                    sampleRate = config.audioSampleRate.hz,
+                    channels = config.audioChannels.count,
+                    captureAudio = !config.isAudioMuted
+                )
+
+                if (vdAttempt != null) {
+                    val presAttempt = runCatching {
+                        val disp = vdAttempt.display
+                        val pres = Presentation(context, disp)
+                        val wv = createConfiguredWebView(
+                            hostContext = pres.context,
+                            bridge = bridge,
+                            resourceHandler = resourceHandler,
+                            hardwareLayer = true,
+                            muteAudioAtBrowser = config.isAudioMuted,
+                            requireUserGesture = false,
+                            documentStartScript = docStartBootstrap
+                        ) {
+                            if (!pageLoaded.isCompleted) pageLoaded.complete(Unit)
+                        }
+                        val container = FrameLayout(pres.context).apply {
+                            setBackgroundColor(Color.WHITE)
+                            addView(
+                                wv,
+                                ViewGroup.LayoutParams(
+                                    ViewGroup.LayoutParams.MATCH_PARENT,
+                                    ViewGroup.LayoutParams.MATCH_PARENT
+                                )
+                            )
+                        }
+                        pres.setContentView(container)
+                        pres.show()
+                        vdAttempt.setSurface(pipeline.inputSurface)
+                        Pair(pres, wv)
+                    }
+
+                    if (presAttempt.isSuccess) {
+                        val (pres, wv) = presAttempt.getOrThrow()
+                        virtualDisplay = vdAttempt
+                        presentation = pres
+                        webView = wv
+                        usingPresentation = true
+                    } else {
+                        runCatching { vdAttempt.setSurface(null) }
+                        runCatching { vdAttempt.release() }
+                    }
                 }
 
-                renderNode = RenderNode("html2mp4_frame").apply {
-                    setPosition(0, 0, width, height)
-                }
-                hardwareRenderer = HardwareRenderer().apply {
-                    setSurface(pipeline.inputSurface)
-                    setContentRoot(renderNode)
+                runCatching { probeSurface.release() }
+                runCatching { probeTex.release() }
+
+                if (!usingPresentation) {
+                    // 100% crash-free Software Layer fallback with single reusable Bitmap
+                    reusableBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                    bitmapCanvas = Canvas(reusableBitmap!!)
+                    webView = createConfiguredWebView(
+                        hostContext = context,
+                        bridge = bridge,
+                        resourceHandler = resourceHandler,
+                        hardwareLayer = false,
+                        muteAudioAtBrowser = config.isAudioMuted,
+                        requireUserGesture = false,
+                        documentStartScript = docStartBootstrap
+                    ) {
+                        if (!pageLoaded.isCompleted) pageLoaded.complete(Unit)
+                    }.apply {
+                        measure(
+                            View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+                            View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY)
+                        )
+                        layout(0, 0, width, height)
+                    }
                 }
 
+                webView?.onResume()
                 webView?.loadUrl(SafWebResourceHandler.ENTRY_URL)
             }
 
@@ -138,7 +252,6 @@ class WebViewOffscreenRenderer(
             }
 
             bridge.isCapturingAudio = !config.isAudioMuted
-            val frameDurationNs = 1_000_000_000L / fps
             val frameDurationMs = 1000L / fps
             val startWallMs = System.currentTimeMillis()
             val silenceFrameBytes = ByteArray((config.audioSampleRate.hz / fps) * 2 * config.audioChannels.count)
@@ -146,7 +259,6 @@ class WebViewOffscreenRenderer(
             for (frameIdx in 0 until totalFrames) {
                 if (!coroutineContext.isActive) break
 
-                // Throttle slightly if Exynos 850 RAM gets tight
                 if (memoryGuard.shouldThrottleFrameQueue()) {
                     delay(8L)
                 }
@@ -157,19 +269,22 @@ class WebViewOffscreenRenderer(
                     delay(targetElapsedMs - actualElapsedMs)
                 }
 
-                val ptsNs = frameIdx * frameDurationNs
                 withContext(Dispatchers.Main) {
-                    val node = renderNode ?: return@withContext
-                    val renderer = hardwareRenderer ?: return@withContext
                     val wv = webView ?: return@withContext
-
-                    val canvas = node.beginRecording(width, height)
-                    wv.draw(canvas)
-                    node.endRecording()
-
-                    renderer.createRenderRequest()
-                        .setVsyncTime(ptsNs)
-                        .syncAndDraw()
+                    if (usingPresentation) {
+                        wv.invalidate()
+                    } else {
+                        val bmp = reusableBitmap ?: return@withContext
+                        val bCanvas = bitmapCanvas ?: return@withContext
+                        bmp.eraseColor(Color.WHITE)
+                        wv.draw(bCanvas)
+                        val surfCanvas = pipeline.inputSurface.lockCanvas(null)
+                        try {
+                            surfCanvas.drawBitmap(bmp, 0f, 0f, null)
+                        } finally {
+                            pipeline.inputSurface.unlockCanvasAndPost(surfCanvas)
+                        }
+                    }
                 }
 
                 pipeline.drainVideo(endOfStream = false)
@@ -181,7 +296,6 @@ class WebViewOffscreenRenderer(
                         pipeline.feedAudioPcm(chunk.pcmBytes)
                         drainedAny = true
                     }
-                    // Keep audio track timeline synchronized even during silent HTML segments
                     if (!drainedAny && frameIdx % 2 == 0) {
                         pipeline.feedAudioPcm(silenceFrameBytes)
                     }
@@ -224,9 +338,11 @@ class WebViewOffscreenRenderer(
         } finally {
             bridge.isCapturingAudio = false
             withContext(Dispatchers.Main) {
-                runCatching { hardwareRenderer?.destroy() }
-                runCatching { renderNode?.discardDisplayList() }
                 destroyWebViewSafely(webView)
+                runCatching { presentation?.dismiss() }
+                runCatching { virtualDisplay?.setSurface(null) }
+                runCatching { virtualDisplay?.release() }
+                runCatching { reusableBitmap?.recycle() }
             }
             pipeline.release()
         }
@@ -234,16 +350,34 @@ class WebViewOffscreenRenderer(
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun createConfiguredWebView(
+        hostContext: Context,
         bridge: HtmlBridge,
         resourceHandler: SafWebResourceHandler,
+        hardwareLayer: Boolean,
+        muteAudioAtBrowser: Boolean,
+        requireUserGesture: Boolean,
+        documentStartScript: String?,
         onFinished: () -> Unit
     ): WebView {
-        return WebView(context).apply {
-            setLayerType(View.LAYER_TYPE_HARDWARE, null)
+        return WebView(hostContext).apply {
+            setLayerType(
+                if (hardwareLayer) View.LAYER_TYPE_HARDWARE else View.LAYER_TYPE_SOFTWARE,
+                null
+            )
+            if (muteAudioAtBrowser && WebViewFeature.isFeatureSupported(WebViewFeature.MUTE_AUDIO)) {
+                runCatching { WebViewCompat.setAudioMuted(this, true) }
+            }
+            if (!documentStartScript.isNullOrBlank() &&
+                WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)
+            ) {
+                runCatching {
+                    WebViewCompat.addDocumentStartJavaScript(this, documentStartScript, setOf("*"))
+                }
+            }
             settings.apply {
                 javaScriptEnabled = true
                 domStorageEnabled = true
-                mediaPlaybackRequiresUserGesture = false
+                mediaPlaybackRequiresUserGesture = requireUserGesture
                 allowFileAccess = false
                 allowContentAccess = true
                 cacheMode = WebSettings.LOAD_NO_CACHE

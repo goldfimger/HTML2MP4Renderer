@@ -13,7 +13,7 @@ import java.nio.ByteBuffer
 
 /**
  * Hardware-accelerated MediaCodec + MediaMuxer pipeline tuned for Exynos 850 MFC.
- * Video frames enter via zero-copy Surface (no Bitmap/ByteArray copies on CPU).
+ * Enforces strictly monotonic PTS and safe encoder fallback so MediaMuxer never throws.
  */
 class MediaCodecMuxerPipeline(
     private val config: RenderConfig,
@@ -37,24 +37,14 @@ class MediaCodecMuxerPipeline(
 
     private val expectAudioTrack = !config.isAudioMuted
     private var totalAudioSamplesWritten = 0L
+    private var lastVideoPtsUs = -1L
+    private var lastAudioPtsUs = -1L
 
     fun prepare() {
         val width = config.resolvedWidth
         val height = config.resolvedHeight
 
-        val videoFormat = MediaFormat.createVideoFormat(config.videoCodec.mimeType, width, height).apply {
-            setInteger(
-                MediaFormat.KEY_COLOR_FORMAT,
-                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
-            )
-            setInteger(MediaFormat.KEY_BIT_RATE, config.resolvedVideoBitrateBps)
-            setInteger(MediaFormat.KEY_FRAME_RATE, config.frameRate.fps)
-            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
-        }
-
-        videoCodec = MediaCodec.createEncoderByType(config.videoCodec.mimeType).apply {
-            configure(videoFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        }
+        videoCodec = configureVideoEncoderWithFallback(width, height)
         inputSurface = videoCodec.createInputSurface()
         videoCodec.start()
 
@@ -82,6 +72,43 @@ class MediaCodecMuxerPipeline(
         }
 
         muxer = MediaMuxer(tempOutputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+
+        // Seed 1 tiny silence frame early so audioTrackIndex registers alongside videoTrackIndex
+        if (expectAudioTrack) {
+            val warmupSilence = ByteArray(1024 * 2 * config.audioChannels.count)
+            feedAudioPcm(warmupSilence)
+        }
+    }
+
+    private fun configureVideoEncoderWithFallback(width: Int, height: Int): MediaCodec {
+        val mime = config.videoCodec.mimeType
+        return try {
+            val fmt = createVideoFormat(mime, width, height)
+            MediaCodec.createEncoderByType(mime).apply {
+                configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            }
+        } catch (_: Throwable) {
+            // Safe fallback to H.264/AVC with 16-px macroblock alignment if custom size/HEVC is rejected
+            val fallbackMime = MediaFormat.MIMETYPE_VIDEO_AVC
+            val alignedW = (((width + 8) / 16) * 16).coerceAtLeast(320)
+            val alignedH = (((height + 8) / 16) * 16).coerceAtLeast(240)
+            val fmt = createVideoFormat(fallbackMime, alignedW, alignedH)
+            MediaCodec.createEncoderByType(fallbackMime).apply {
+                configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            }
+        }
+    }
+
+    private fun createVideoFormat(mime: String, width: Int, height: Int): MediaFormat {
+        return MediaFormat.createVideoFormat(mime, width, height).apply {
+            setInteger(
+                MediaFormat.KEY_COLOR_FORMAT,
+                MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface
+            )
+            setInteger(MediaFormat.KEY_BIT_RATE, config.resolvedVideoBitrateBps)
+            setInteger(MediaFormat.KEY_FRAME_RATE, config.frameRate.fps)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+        }
     }
 
     private fun resolveSupportedAudioMime(requested: AudioCodecOption): String {
@@ -90,20 +117,21 @@ class MediaCodecMuxerPipeline(
         val hasMp3Encoder = list.codecInfos.any { info ->
             info.isEncoder && info.supportedTypes.any { it.equals(MediaFormat.MIMETYPE_AUDIO_MPEG, true) }
         }
-        // Standard MP4 container + Exynos AOSP devices universally support AAC-LC hardware/platform encoding
         return if (hasMp3Encoder) MediaFormat.MIMETYPE_AUDIO_MPEG else MediaFormat.MIMETYPE_AUDIO_AAC
     }
 
     fun drainVideo(endOfStream: Boolean) {
         if (endOfStream) {
-            videoCodec.signalEndOfInputStream()
+            runCatching { videoCodec.signalEndOfInputStream() }
         }
 
-        while (true) {
+        var emptyLoops = 0
+        while (emptyLoops < 120) {
             val status = videoCodec.dequeueOutputBuffer(videoBufferInfo, if (endOfStream) 10_000L else 0L)
             when {
                 status == MediaCodec.INFO_TRY_AGAIN_LATER -> {
                     if (!endOfStream) break
+                    emptyLoops++
                 }
                 status == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                     synchronized(muxerLock) {
@@ -114,11 +142,16 @@ class MediaCodecMuxerPipeline(
                     }
                 }
                 status >= 0 -> {
+                    emptyLoops = 0
                     val encodedData = videoCodec.getOutputBuffer(status)
                     if (encodedData != null && (videoBufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
                         if (videoBufferInfo.size > 0) {
                             synchronized(muxerLock) {
                                 if (muxerStarted) {
+                                    if (videoBufferInfo.presentationTimeUs <= lastVideoPtsUs) {
+                                        videoBufferInfo.presentationTimeUs = lastVideoPtsUs + 1
+                                    }
+                                    lastVideoPtsUs = videoBufferInfo.presentationTimeUs
                                     encodedData.position(videoBufferInfo.offset)
                                     encodedData.limit(videoBufferInfo.offset + videoBufferInfo.size)
                                     muxer!!.writeSampleData(videoTrackIndex, encodedData, videoBufferInfo)
@@ -136,15 +169,19 @@ class MediaCodecMuxerPipeline(
     fun feedAudioPcm(pcmBytes: ByteArray) {
         val codec = audioCodec ?: return
         var offset = 0
-        while (offset < pcmBytes.size) {
-            val inIdx = codec.dequeueInputBuffer(5_000L)
+        var retries = 0
+        while (offset < pcmBytes.size && retries < 24) {
+            val inIdx = codec.dequeueInputBuffer(4_000L)
             if (inIdx < 0) {
                 drainAudio(endOfStream = false)
+                retries++
                 continue
             }
+            retries = 0
             val buf = codec.getInputBuffer(inIdx) ?: break
             buf.clear()
             val toCopy = minOf(buf.remaining(), pcmBytes.size - offset)
+            if (toCopy <= 0) break
             buf.put(pcmBytes, offset, toCopy)
 
             val bytesPerSampleFrame = 2 * config.audioChannels.count
@@ -170,11 +207,13 @@ class MediaCodecMuxerPipeline(
 
     private fun drainAudio(endOfStream: Boolean) {
         val codec = audioCodec ?: return
-        while (true) {
+        var emptyLoops = 0
+        while (emptyLoops < 120) {
             val status = codec.dequeueOutputBuffer(audioBufferInfo, if (endOfStream) 10_000L else 0L)
             when {
                 status == MediaCodec.INFO_TRY_AGAIN_LATER -> {
                     if (!endOfStream) break
+                    emptyLoops++
                 }
                 status == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                     synchronized(muxerLock) {
@@ -185,11 +224,16 @@ class MediaCodecMuxerPipeline(
                     }
                 }
                 status >= 0 -> {
+                    emptyLoops = 0
                     val encodedData: ByteBuffer? = codec.getOutputBuffer(status)
                     if (encodedData != null && (audioBufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
                         if (audioBufferInfo.size > 0) {
                             synchronized(muxerLock) {
                                 if (muxerStarted) {
+                                    if (audioBufferInfo.presentationTimeUs <= lastAudioPtsUs) {
+                                        audioBufferInfo.presentationTimeUs = lastAudioPtsUs + 1
+                                    }
+                                    lastAudioPtsUs = audioBufferInfo.presentationTimeUs
                                     encodedData.position(audioBufferInfo.offset)
                                     encodedData.limit(audioBufferInfo.offset + audioBufferInfo.size)
                                     muxer!!.writeSampleData(audioTrackIndex, encodedData, audioBufferInfo)
@@ -215,9 +259,9 @@ class MediaCodecMuxerPipeline(
     }
 
     fun release() {
-        runCatching { videoCodec.stop() }
-        runCatching { videoCodec.release() }
-        runCatching { inputSurface.release() }
+        runCatching { if (::videoCodec.isInitialized) videoCodec.stop() }
+        runCatching { if (::videoCodec.isInitialized) videoCodec.release() }
+        runCatching { if (::inputSurface.isInitialized) inputSurface.release() }
         runCatching { audioCodec?.stop() }
         runCatching { audioCodec?.release() }
         runCatching {

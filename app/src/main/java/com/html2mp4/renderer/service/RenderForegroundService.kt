@@ -85,7 +85,7 @@ class RenderForegroundService : Service() {
             this,
             NOTIFICATION_ID,
             notification,
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
                 ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
             } else {
                 0

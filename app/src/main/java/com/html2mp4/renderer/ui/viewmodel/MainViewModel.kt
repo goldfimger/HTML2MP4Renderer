@@ -22,6 +22,7 @@ import com.html2mp4.renderer.model.ResolutionPreset
 import com.html2mp4.renderer.model.ThemeMode
 import com.html2mp4.renderer.model.VideoBitratePreset
 import com.html2mp4.renderer.model.VideoCodecOption
+import com.html2mp4.renderer.model.VideoOrientation
 import com.html2mp4.renderer.service.RenderForegroundService
 import com.html2mp4.renderer.util.MemoryGuard
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -89,13 +90,60 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             val baseMeta = repository.readHtmlMetadata(uri, _projectMetadata.value?.assetsTreeUri)
             _projectMetadata.value = baseMeta
             _isProbingDuration.value = true
-            val detectedMs = runCatching {
-                probeRenderer.inspectDurationOnly(uri, baseMeta.assetsTreeUri)
-            }.getOrDefault(10_000L)
-            _projectMetadata.update {
-                it?.copy(detectedDurationMs = detectedMs, isDurationAutoDetected = true)
+            val probe = runCatching {
+                probeRenderer.inspectProjectMetadata(uri, baseMeta.assetsTreeUri)
+            }.getOrNull()
+
+            if (probe != null) {
+                _projectMetadata.update {
+                    it?.copy(
+                        detectedDurationMs = probe.durationMs,
+                        detectedWidth = probe.width,
+                        detectedHeight = probe.height,
+                        detectedOrientation = probe.orientation,
+                        isDurationAutoDetected = true
+                    )
+                }
+                applyAutoDetectedResolution(probe.width, probe.height, probe.orientation)
             }
             _isProbingDuration.value = false
+        }
+    }
+
+    private fun applyAutoDetectedResolution(
+        width: Int,
+        height: Int,
+        orientation: VideoOrientation
+    ) {
+        val shortSide = minOf(width, height)
+        val longSide = maxOf(width, height)
+        val aspect = longSide.toFloat() / shortSide.coerceAtLeast(1).toFloat()
+
+        // If aspect ratio matches ~16:9 / 9:16 (1.6 - 1.9), map cleanly to 480p/720p/1080p preset
+        if (aspect in 1.55f..1.95f) {
+            val preset = when {
+                shortSide >= 1000 -> ResolutionPreset.P1080
+                shortSide >= 640 -> ResolutionPreset.P720
+                else -> ResolutionPreset.P480
+            }
+            _config.update {
+                it.copy(
+                    orientation = orientation,
+                    resolutionPreset = preset,
+                    customWidth = width,
+                    customHeight = height
+                )
+            }
+        } else {
+            // Custom aspect ratio (e.g. 4:5 or 1:1.2) -> apply exact Custom dimensions
+            _config.update {
+                it.copy(
+                    orientation = orientation,
+                    resolutionPreset = ResolutionPreset.CUSTOM,
+                    customWidth = width.coerceIn(320, 1920),
+                    customHeight = height.coerceIn(240, 1920)
+                )
+            }
         }
     }
 
@@ -128,12 +176,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         refreshRenderedVideos()
     }
 
+    fun updateOrientation(orientation: VideoOrientation) {
+        _config.update { current ->
+            if (current.resolutionPreset == ResolutionPreset.CUSTOM) {
+                val w = current.customWidth
+                val h = current.customHeight
+                val swapped = if (orientation == VideoOrientation.PORTRAIT && w > h) Pair(h, w)
+                else if (orientation == VideoOrientation.LANDSCAPE && h > w) Pair(h, w)
+                else Pair(w, h)
+                current.copy(
+                    orientation = orientation,
+                    customWidth = swapped.first,
+                    customHeight = swapped.second
+                )
+            } else {
+                current.copy(orientation = orientation)
+            }
+        }
+    }
+
     fun updateResolution(preset: ResolutionPreset) {
         _config.update { it.copy(resolutionPreset = preset) }
     }
 
     fun updateCustomDimensions(width: Int, height: Int) {
-        _config.update { it.copy(customWidth = width, customHeight = height) }
+        val inferred = if (height > width) VideoOrientation.PORTRAIT else VideoOrientation.LANDSCAPE
+        _config.update { it.copy(customWidth = width, customHeight = height, orientation = inferred) }
     }
 
     fun updateFrameRate(fps: FrameRateOption) {

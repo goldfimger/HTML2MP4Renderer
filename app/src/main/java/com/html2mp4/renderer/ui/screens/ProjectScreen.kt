@@ -64,6 +64,7 @@ import com.html2mp4.renderer.model.RenderStatus
 import com.html2mp4.renderer.model.ResolutionPreset
 import com.html2mp4.renderer.model.VideoBitratePreset
 import com.html2mp4.renderer.model.VideoCodecOption
+import com.html2mp4.renderer.model.VideoOrientation
 import java.util.Locale
 import kotlin.math.roundToInt
 
@@ -76,6 +77,7 @@ fun ProjectScreen(
     onPickHtmlFile: () -> Unit,
     onPickAssetsFolder: () -> Unit,
     onPickOutputFolder: () -> Unit,
+    onOrientationChange: (VideoOrientation) -> Unit,
     onResolutionChange: (ResolutionPreset) -> Unit,
     onCustomSizeChange: (Int, Int) -> Unit,
     onFrameRateChange: (FrameRateOption) -> Unit,
@@ -131,15 +133,27 @@ fun ProjectScreen(
                         )
                         val sizeText = formatBytes(metadata.fileSizeBytes)
                         val durText = if (isProbingDuration) {
-                            "Mendeteksi durasi..."
+                            "Mendeteksi durasi & orientasi..."
                         } else {
                             formatDurationMs(metadata.detectedDurationMs)
                         }
                         Text(
-                            text = "Ukuran: $sizeText · Durasi Terdeteksi: $durText",
+                            text = "Ukuran: $sizeText · Durasi: $durText",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
+                        if (!isProbingDuration && metadata.isDurationAutoDetected) {
+                            val orientText = if (metadata.detectedOrientation == VideoOrientation.PORTRAIT) {
+                                "Vertikal"
+                            } else {
+                                "Lanskap"
+                            }
+                            Text(
+                                text = "Terdeteksi otomatis: ${metadata.detectedWidth}×${metadata.detectedHeight} ($orientText)",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                        }
                         if (metadata.assetsTreeUri != null) {
                             Text(
                                 text = "Folder aset lokal terhubung",
@@ -294,16 +308,51 @@ fun ProjectScreen(
             )
         ) {
             Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Icon(Icons.Rounded.Videocam, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                    Text("Pengaturan Video (Exynos MFC)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Icon(Icons.Rounded.Videocam, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                        Text("Pengaturan Video (Exynos MFC)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    }
+                    Text(
+                        text = "${config.resolvedWidth}×${config.resolvedHeight}",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        fontWeight = FontWeight.SemiBold
+                    )
                 }
 
                 M3Dropdown(
-                    label = "Resolusi",
-                    selectedText = config.resolutionPreset.label,
-                    options = ResolutionPreset.entries,
+                    label = "Orientasi Video",
+                    selectedText = config.orientation.label,
+                    options = VideoOrientation.entries,
                     optionLabel = { it.label },
+                    enabled = !isRendering,
+                    onSelect = onOrientationChange
+                )
+
+                M3Dropdown(
+                    label = "Resolusi",
+                    selectedText = if (config.resolutionPreset == ResolutionPreset.CUSTOM) {
+                        "Custom (${config.resolvedWidth}×${config.resolvedHeight})"
+                    } else if (config.orientation == VideoOrientation.PORTRAIT) {
+                        "${config.resolutionPreset.label} (${config.resolutionPreset.shortSide}×${config.resolutionPreset.longSide})"
+                    } else {
+                        "${config.resolutionPreset.label} (${config.resolutionPreset.longSide}×${config.resolutionPreset.shortSide})"
+                    },
+                    options = ResolutionPreset.entries,
+                    optionLabel = { preset ->
+                        when {
+                            preset == ResolutionPreset.CUSTOM -> "Custom (Atur W × H)"
+                            config.orientation == VideoOrientation.PORTRAIT ->
+                                "${preset.label} (${preset.shortSide}×${preset.longSide})"
+                            else ->
+                                "${preset.label} (${preset.longSide}×${preset.shortSide})"
+                        }
+                    },
                     enabled = !isRendering,
                     onSelect = onResolutionChange
                 )

@@ -3,10 +3,15 @@ package com.html2mp4.renderer.model
 import android.media.MediaFormat
 import android.net.Uri
 
-enum class ResolutionPreset(val label: String, val width: Int, val height: Int) {
-    P480("480p (854×480)", 854, 480),
-    P720("720p HD (1280×720)", 1280, 720),
-    P1080("1080p FHD (1920×1080)", 1920, 1080),
+enum class VideoOrientation(val label: String) {
+    LANDSCAPE("Lanskap (16:9)"),
+    PORTRAIT("Vertikal (9:16)")
+}
+
+enum class ResolutionPreset(val label: String, val longSide: Int, val shortSide: Int) {
+    P480("480p", 854, 480),
+    P720("720p HD", 1280, 720),
+    P1080("1080p FHD", 1920, 1080),
     CUSTOM("Custom", 1280, 720)
 }
 
@@ -61,11 +66,15 @@ data class HtmlProjectMetadata(
     val fileName: String,
     val fileSizeBytes: Long,
     val detectedDurationMs: Long,
+    val detectedWidth: Int = 1280,
+    val detectedHeight: Int = 720,
+    val detectedOrientation: VideoOrientation = VideoOrientation.LANDSCAPE,
     val assetsTreeUri: Uri? = null,
     val isDurationAutoDetected: Boolean = false
 )
 
 data class RenderConfig(
+    val orientation: VideoOrientation = VideoOrientation.LANDSCAPE,
     val resolutionPreset: ResolutionPreset = ResolutionPreset.P720,
     val customWidth: Int = 1280,
     val customHeight: Int = 720,
@@ -83,15 +92,21 @@ data class RenderConfig(
     val durationOverrideSec: Int? = null
 ) {
     val resolvedWidth: Int
-        get() = alignTo16(
-            if (resolutionPreset == ResolutionPreset.CUSTOM) customWidth.coerceIn(320, 1920)
-            else resolutionPreset.width
+        get() = alignToEven(
+            when {
+                resolutionPreset == ResolutionPreset.CUSTOM -> customWidth.coerceIn(320, 1920)
+                orientation == VideoOrientation.PORTRAIT -> resolutionPreset.shortSide
+                else -> resolutionPreset.longSide
+            }
         )
 
     val resolvedHeight: Int
-        get() = alignTo16(
-            if (resolutionPreset == ResolutionPreset.CUSTOM) customHeight.coerceIn(240, 1920)
-            else resolutionPreset.height
+        get() = alignToEven(
+            when {
+                resolutionPreset == ResolutionPreset.CUSTOM -> customHeight.coerceIn(240, 1920)
+                orientation == VideoOrientation.PORTRAIT -> resolutionPreset.longSide
+                else -> resolutionPreset.shortSide
+            }
         )
 
     val resolvedVideoBitrateBps: Int
@@ -112,7 +127,7 @@ data class RenderConfig(
             return kbps * 1_000
         }
 
-    private fun alignTo16(value: Int): Int = ((value + 8) / 16) * 16
+    private fun alignToEven(value: Int): Int = (value / 2) * 2
 }
 
 sealed interface RenderStatus {

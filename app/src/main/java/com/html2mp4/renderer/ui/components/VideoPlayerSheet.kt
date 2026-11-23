@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Close
@@ -81,6 +82,12 @@ fun VideoPlayerDialog(
                     }
                 }
 
+                val videoAspect = if (video.width > 0 && video.height > 0) {
+                    (video.width.toFloat() / video.height.toFloat()).coerceIn(0.45f, 2.4f)
+                } else {
+                    16f / 9f
+                }
+
                 AndroidView(
                     factory = { ctx ->
                         PlayerView(ctx).apply {
@@ -90,7 +97,8 @@ fun VideoPlayerDialog(
                     },
                     modifier = Modifier
                         .fillMaxWidth()
-                        .aspectRatio(16f / 9f)
+                        .heightIn(max = 460.dp)
+                        .aspectRatio(videoAspect)
                 )
 
                 Row(

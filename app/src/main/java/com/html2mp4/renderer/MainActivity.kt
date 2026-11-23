@@ -142,6 +142,7 @@ class MainActivity : ComponentActivity() {
                                 },
                                 onPickAssetsFolder = { assetsFolderLauncher.launch(null) },
                                 onPickOutputFolder = { outputFolderLauncher.launch(null) },
+                                onOrientationChange = vm::updateOrientation,
                                 onResolutionChange = vm::updateResolution,
                                 onCustomSizeChange = vm::updateCustomDimensions,
                                 onFrameRateChange = vm::updateFrameRate,

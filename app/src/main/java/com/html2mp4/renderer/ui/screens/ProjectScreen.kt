@@ -299,6 +299,7 @@ fun ProjectScreen(
             }
             RenderStatus.Idle -> Unit
         }
+        }
     }
 
     val parametersColumn: @Composable () -> Unit = {

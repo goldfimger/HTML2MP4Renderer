@@ -1,0 +1,3 @@
+<resources>
+    <style name="Theme.HTML2MP4Renderer" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>

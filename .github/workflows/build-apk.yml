@@ -1,0 +1,84 @@
+name: Build HTML2MP4 Renderer APK
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      build_variant:
+        description: 'Build variant (debug or both)'
+        required: false
+        default: 'debug'
+        type: choice
+        options:
+          - debug
+          - both
+
+permissions:
+  contents: write
+
+jobs:
+  build-android-apk:
+    name: Compile Android 15 APK (ARM64-v8a)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17 (Temurin)
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle & Cache
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.10.2'
+
+      - name: Ensure Gradle Wrapper Exists
+        run: |
+          if [ ! -f ./gradlew ]; then
+            gradle wrapper --gradle-version 8.10.2 --no-daemon
+          fi
+          chmod +x ./gradlew
+
+      - name: Build Debug APK (arm64-v8a)
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Build Release APK (Unsigned / CI Test)
+        if: ${{ github.event.inputs.build_variant == 'both' }}
+        run: ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Rename Output APKs for Distribution
+        run: |
+          mkdir -p dist-apk
+          cp app/build/outputs/apk/debug/*.apk dist-apk/HTML2MP4-Renderer-v1.0.0-arm64-v8a-debug.apk
+          if [ -d app/build/outputs/apk/release ]; then
+            find app/build/outputs/apk/release -name "*.apk" -exec cp {} dist-apk/HTML2MP4-Renderer-v1.0.0-arm64-v8a-release-unsigned.apk \;
+          fi
+          ls -lh dist-apk/
+
+      - name: Upload APK to GitHub Actions Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: HTML2MP4-Renderer-Android15-arm64-v8a
+          path: dist-apk/*.apk
+          retention-days: 30
+
+      - name: Publish APK to GitHub Releases
+        if: github.ref == 'refs/heads/main'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: HTML2MP4 Renderer v1.0.${{ github.run_number }} (Android 15 · Exynos 850)
+          body: |
+            Automated build for **HTML2MP4 Renderer** optimized for **Exynos 850 (ARM64-v8a)** on **Android 15 (API 35)**.
+            - Hardware MediaCodec (H.264 / HEVC) + MediaMuxer zero-copy Surface pipeline
+            - Android 15 ForegroundService (mediaProcessing) compliant
+            - Material You (Monet) Jetpack Compose UI
+          files: dist-apk/*.apk
+          draft: false
+          prerelease: false

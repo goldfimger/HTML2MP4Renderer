@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">HTML2MP4 Renderer</string>
+    <string name="notif_channel_render">Proses Rendering Video</string>
+    <string name="notif_channel_render_desc">Menampilkan progres konversi HTML ke MP4 di latar belakang</string>
+</resources>

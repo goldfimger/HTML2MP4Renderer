@@ -65,11 +65,16 @@ import com.html2mp4.renderer.model.ResolutionPreset
 import com.html2mp4.renderer.model.VideoBitratePreset
 import com.html2mp4.renderer.model.VideoCodecOption
 import com.html2mp4.renderer.model.VideoOrientation
+import com.html2mp4.renderer.ui.i18n.AppStrings
+import com.html2mp4.renderer.util.DeviceProfile
 import java.util.Locale
 import kotlin.math.roundToInt
 
 @Composable
 fun ProjectScreen(
+    strings: AppStrings,
+    deviceProfile: DeviceProfile,
+    isWideScreen: Boolean,
     metadata: HtmlProjectMetadata?,
     isProbingDuration: Boolean,
     config: RenderConfig,
@@ -96,13 +101,8 @@ fun ProjectScreen(
 ) {
     val isRendering = renderStatus is RenderStatus.Preparing || renderStatus is RenderStatus.Rendering
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(horizontal = 16.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
-    ) {
+    val sourceAndActionColumn: @Composable () -> Unit = {
+        Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
         // 1. HTML Source Card (Strict Metadata Only — No HTML preview, No Source Code Viewer)
         ElevatedCard(
             modifier = Modifier.fillMaxWidth(),
@@ -113,12 +113,12 @@ fun ProjectScreen(
             Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Icon(Icons.Rounded.Description, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                    Text("Sumber Dokumen HTML", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                    Text(strings.htmlSourceTitle, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                 }
 
                 if (metadata == null) {
                     Text(
-                        text = "Pilih file .html melalui Storage Access Framework. Isi kode HTML tidak dimuat ke memori UI agar bebas OOM.",
+                        text = strings.htmlSourceHint,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -133,30 +133,30 @@ fun ProjectScreen(
                         )
                         val sizeText = formatBytes(metadata.fileSizeBytes)
                         val durText = if (isProbingDuration) {
-                            "Mendeteksi durasi & orientasi..."
+                            strings.detectingMeta
                         } else {
                             formatDurationMs(metadata.detectedDurationMs)
                         }
                         Text(
-                            text = "Ukuran: $sizeText · Durasi: $durText",
+                            text = "${strings.sizePrefix}: $sizeText · ${strings.durationPrefix}: $durText",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         if (!isProbingDuration && metadata.isDurationAutoDetected) {
                             val orientText = if (metadata.detectedOrientation == VideoOrientation.PORTRAIT) {
-                                "Vertikal"
+                                strings.portraitLabel
                             } else {
-                                "Lanskap"
+                                strings.landscapeLabel
                             }
                             Text(
-                                text = "Terdeteksi otomatis: ${metadata.detectedWidth}×${metadata.detectedHeight} ($orientText)",
+                                text = "${strings.autoDetectedPrefix}: ${metadata.detectedWidth}×${metadata.detectedHeight} ($orientText)",
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.primary
                             )
                         }
                         if (metadata.assetsTreeUri != null) {
                             Text(
-                                text = "Folder aset lokal terhubung",
+                                text = strings.assetsConnected,
                                 style = MaterialTheme.typography.labelSmall,
                                 color = MaterialTheme.colorScheme.primary
                             )
@@ -172,14 +172,14 @@ fun ProjectScreen(
                     ) {
                         Icon(Icons.Rounded.FolderOpen, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(Modifier.width(6.dp))
-                        Text(if (metadata == null) "Pilih File HTML" else "Ganti HTML", maxLines = 1)
+                        Text(if (metadata == null) strings.pickHtmlButton else strings.changeHtmlButton, maxLines = 1)
                     }
                     if (metadata != null) {
                         OutlinedButton(
                             onClick = onPickAssetsFolder,
                             enabled = !isRendering
                         ) {
-                            Text("Aset Lokal", maxLines = 1)
+                            Text(strings.localAssetsButton, maxLines = 1)
                         }
                     }
                 }
@@ -191,7 +191,7 @@ fun ProjectScreen(
             is RenderStatus.Preparing -> {
                 ElevatedCard(modifier = Modifier.fillMaxWidth()) {
                     Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                        Text("Menyiapkan Pipeline...", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                        Text(strings.preparingPipeline, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
                         LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
                         Text(renderStatus.message, style = MaterialTheme.typography.bodySmall)
                     }
@@ -211,7 +211,7 @@ fun ProjectScreen(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = "Merender Video (${renderStatus.progressPercent}%)",
+                                text = strings.renderingTitleFormat(renderStatus.progressPercent),
                                 style = MaterialTheme.typography.titleMedium,
                                 fontWeight = FontWeight.Bold
                             )
@@ -246,7 +246,7 @@ fun ProjectScreen(
                             ) {
                                 Icon(Icons.Rounded.Cancel, contentDescription = null, modifier = Modifier.size(16.dp))
                                 Spacer(Modifier.width(4.dp))
-                                Text("Batal")
+                                Text(strings.cancelButton)
                             }
                         }
                     }
@@ -261,14 +261,14 @@ fun ProjectScreen(
                     ) {
                         Icon(Icons.Rounded.CheckCircle, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("Render Selesai", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                            Text(strings.renderCompleted, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
                             Text(renderStatus.fileName, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         }
                         TextButton(onClick = {
                             onDismissStatus()
                             onNavigateToResults()
                         }) {
-                            Text("Lihat Hasil")
+                            Text(strings.viewResults)
                         }
                     }
                 }
@@ -280,12 +280,12 @@ fun ProjectScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "Gagal: ${renderStatus.errorMessage}",
+                            text = "${strings.failedPrefix}: ${renderStatus.errorMessage}",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.error,
                             modifier = Modifier.weight(1f)
                         )
-                        TextButton(onClick = onDismissStatus) { Text("Tutup") }
+                        TextButton(onClick = onDismissStatus) { Text(strings.closeButton) }
                     }
                 }
             }
@@ -293,13 +293,16 @@ fun ProjectScreen(
                 ElevatedCard(modifier = Modifier.fillMaxWidth()) {
                     Row(modifier = Modifier.padding(16.dp).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                         Text(renderStatus.reason, style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
-                        TextButton(onClick = onDismissStatus) { Text("OK") }
+                        TextButton(onClick = onDismissStatus) { Text(strings.okButton) }
                     }
                 }
             }
             RenderStatus.Idle -> Unit
         }
+    }
 
+    val parametersColumn: @Composable () -> Unit = {
+        Column(verticalArrangement = Arrangement.spacedBy(14.dp)) {
         // 3. Video Parameters Card
         ElevatedCard(
             modifier = Modifier.fillMaxWidth(),
@@ -315,7 +318,14 @@ fun ProjectScreen(
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Icon(Icons.Rounded.Videocam, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                        Text("Pengaturan Video (Exynos MFC)", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                        Column {
+                            Text(strings.videoSettingsTitle, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                            Text(
+                                text = deviceProfile.shortLabel,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
                     }
                     Text(
                         text = "${config.resolvedWidth}×${config.resolvedHeight}",
@@ -326,31 +336,31 @@ fun ProjectScreen(
                 }
 
                 M3Dropdown(
-                    label = "Orientasi Video",
-                    selectedText = config.orientation.label,
+                    label = strings.videoOrientationLabel,
+                    selectedText = strings.orientationLabel(config.orientation),
                     options = VideoOrientation.entries,
-                    optionLabel = { it.label },
+                    optionLabel = { strings.orientationLabel(it) },
                     enabled = !isRendering,
                     onSelect = onOrientationChange
                 )
 
                 M3Dropdown(
-                    label = "Resolusi",
+                    label = strings.resolutionLabel,
                     selectedText = if (config.resolutionPreset == ResolutionPreset.CUSTOM) {
                         "Custom (${config.resolvedWidth}×${config.resolvedHeight})"
                     } else if (config.orientation == VideoOrientation.PORTRAIT) {
-                        "${config.resolutionPreset.label} (${config.resolutionPreset.shortSide}×${config.resolutionPreset.longSide})"
+                        "${strings.resolutionLabel(config.resolutionPreset)} (${config.resolutionPreset.shortSide}×${config.resolutionPreset.longSide})"
                     } else {
-                        "${config.resolutionPreset.label} (${config.resolutionPreset.longSide}×${config.resolutionPreset.shortSide})"
+                        "${strings.resolutionLabel(config.resolutionPreset)} (${config.resolutionPreset.longSide}×${config.resolutionPreset.shortSide})"
                     },
                     options = ResolutionPreset.entries,
                     optionLabel = { preset ->
                         when {
-                            preset == ResolutionPreset.CUSTOM -> "Custom (Atur W × H)"
+                            preset == ResolutionPreset.CUSTOM -> strings.customResolutionOption
                             config.orientation == VideoOrientation.PORTRAIT ->
-                                "${preset.label} (${preset.shortSide}×${preset.longSide})"
+                                "${strings.resolutionLabel(preset)} (${preset.shortSide}×${preset.longSide})"
                             else ->
-                                "${preset.label} (${preset.longSide}×${preset.shortSide})"
+                                "${strings.resolutionLabel(preset)} (${preset.longSide}×${preset.shortSide})"
                         }
                     },
                     enabled = !isRendering,
@@ -362,7 +372,7 @@ fun ProjectScreen(
                         OutlinedTextField(
                             value = config.customWidth.toString(),
                             onValueChange = { v -> v.toIntOrNull()?.let { onCustomSizeChange(it, config.customHeight) } },
-                            label = { Text("Lebar (px)") },
+                            label = { Text(strings.widthPxLabel) },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                             singleLine = true,
                             enabled = !isRendering,
@@ -371,7 +381,7 @@ fun ProjectScreen(
                         OutlinedTextField(
                             value = config.customHeight.toString(),
                             onValueChange = { v -> v.toIntOrNull()?.let { onCustomSizeChange(config.customWidth, it) } },
-                            label = { Text("Tinggi (px)") },
+                            label = { Text(strings.heightPxLabel) },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                             singleLine = true,
                             enabled = !isRendering,
@@ -381,28 +391,28 @@ fun ProjectScreen(
                 }
 
                 M3Dropdown(
-                    label = "Frame Rate",
-                    selectedText = config.frameRate.label,
+                    label = strings.frameRateLabel,
+                    selectedText = strings.fpsLabel(config.frameRate),
                     options = FrameRateOption.entries,
-                    optionLabel = { it.label },
+                    optionLabel = { strings.fpsLabel(it) },
                     enabled = !isRendering,
                     onSelect = onFrameRateChange
                 )
 
                 M3Dropdown(
-                    label = "Codec Video",
-                    selectedText = config.videoCodec.label,
+                    label = strings.videoCodecLabel,
+                    selectedText = strings.videoCodecLabel(config.videoCodec),
                     options = VideoCodecOption.entries,
-                    optionLabel = { it.label },
+                    optionLabel = { strings.videoCodecLabel(it) },
                     enabled = !isRendering,
                     onSelect = onVideoCodecChange
                 )
 
                 M3Dropdown(
-                    label = "Bitrate Video",
-                    selectedText = config.bitratePreset.label,
+                    label = strings.videoBitrateLabel,
+                    selectedText = strings.bitratePresetLabel(config.bitratePreset),
                     options = VideoBitratePreset.entries,
-                    optionLabel = { it.label },
+                    optionLabel = { strings.bitratePresetLabel(it) },
                     enabled = !isRendering,
                     onSelect = onVideoBitratePresetChange
                 )
@@ -410,7 +420,7 @@ fun ProjectScreen(
                 if (config.bitratePreset == VideoBitratePreset.CUSTOM) {
                     Column {
                         Text(
-                            text = "Target Bitrate: ${config.customBitrateKbps} Kbps",
+                            text = strings.targetBitrateFormat(config.customBitrateKbps),
                             style = MaterialTheme.typography.bodySmall,
                             fontWeight = FontWeight.Medium
                         )
@@ -441,10 +451,10 @@ fun ProjectScreen(
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Icon(Icons.Rounded.AudioFile, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                        Text("Pengaturan Audio", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                        Text(strings.audioSettingsTitle, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                     }
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text("Tanpa Audio", style = MaterialTheme.typography.bodySmall)
+                        Text(strings.muteAudioLabel, style = MaterialTheme.typography.bodySmall)
                         Switch(
                             checked = config.isAudioMuted,
                             onCheckedChange = onAudioMutedChange,
@@ -455,10 +465,10 @@ fun ProjectScreen(
 
                 if (!config.isAudioMuted) {
                     M3Dropdown(
-                        label = "Codec Audio",
-                        selectedText = config.audioCodec.label,
+                        label = strings.audioCodecLabel,
+                        selectedText = strings.audioCodecLabel(config.audioCodec),
                         options = AudioCodecOption.entries,
-                        optionLabel = { it.label },
+                        optionLabel = { strings.audioCodecLabel(it) },
                         enabled = !isRendering,
                         onSelect = onAudioCodecChange
                     )
@@ -466,7 +476,7 @@ fun ProjectScreen(
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Column(modifier = Modifier.weight(1f)) {
                             M3Dropdown(
-                                label = "Sample Rate",
+                                label = strings.sampleRateLabel,
                                 selectedText = config.audioSampleRate.label,
                                 options = AudioSampleRate.entries,
                                 optionLabel = { it.label },
@@ -476,10 +486,10 @@ fun ProjectScreen(
                         }
                         Column(modifier = Modifier.weight(1f)) {
                             M3Dropdown(
-                                label = "Channel",
-                                selectedText = config.audioChannels.label,
+                                label = strings.channelLabel,
+                                selectedText = strings.audioChannelLabel(config.audioChannels),
                                 options = AudioChannelOption.entries,
-                                optionLabel = { it.label },
+                                optionLabel = { strings.audioChannelLabel(it) },
                                 enabled = !isRendering,
                                 onSelect = onAudioChannelsChange
                             )
@@ -487,7 +497,7 @@ fun ProjectScreen(
                     }
 
                     M3Dropdown(
-                        label = "Bitrate Audio",
+                        label = strings.audioBitrateLabel,
                         selectedText = config.audioBitrate.label,
                         options = AudioBitrateOption.entries,
                         optionLabel = { it.label },
@@ -511,7 +521,7 @@ fun ProjectScreen(
                 horizontalArrangement = Arrangement.SpaceBetween
             ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    Text("Lokasi Output MP4", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                    Text(strings.outputLocationTitle, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
                     Text(
                         text = config.outputFolderDisplay,
                         style = MaterialTheme.typography.bodySmall,
@@ -521,29 +531,66 @@ fun ProjectScreen(
                     )
                 }
                 OutlinedButton(onClick = onPickOutputFolder, enabled = !isRendering) {
-                    Text("Ubah Folder")
+                    Text(strings.changeFolderButton)
                 }
             }
         }
+        }
+    }
 
-        HorizontalDivider()
+    val renderCtaSection: @Composable () -> Unit = {
+        Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+            HorizontalDivider()
 
-        // 6. Primary Render CTA
-        Button(
-            onClick = onStartRender,
-            enabled = metadata != null && !isRendering,
-            modifier = Modifier.fillMaxWidth().height(52.dp)
-        ) {
-            Icon(
-                imageVector = if (isRendering) Icons.Rounded.MovieCreation else Icons.Rounded.PlayArrow,
-                contentDescription = null
-            )
-            Spacer(Modifier.width(8.dp))
-            Text(
-                text = if (isRendering) "Sedang Merender..." else "Mulai Render",
-                style = MaterialTheme.typography.titleSmall,
-                fontWeight = FontWeight.SemiBold
-            )
+            // 6. Primary Render CTA
+            Button(
+                onClick = onStartRender,
+                enabled = metadata != null && !isRendering,
+                modifier = Modifier.fillMaxWidth().height(52.dp)
+            ) {
+                Icon(
+                    imageVector = if (isRendering) Icons.Rounded.MovieCreation else Icons.Rounded.PlayArrow,
+                    contentDescription = null
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = if (isRendering) strings.renderingCta else strings.startRenderCta,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 16.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        if (isWideScreen) {
+            // Tablet & Chromebook (Googlebook) 2-column responsive layout
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(16.dp),
+                verticalAlignment = Alignment.Top
+            ) {
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    sourceAndActionColumn()
+                    renderCtaSection()
+                }
+                Column(modifier = Modifier.weight(1f)) {
+                    parametersColumn()
+                }
+            }
+        } else {
+            sourceAndActionColumn()
+            parametersColumn()
+            renderCtaSection()
         }
 
         Spacer(Modifier.height(12.dp))

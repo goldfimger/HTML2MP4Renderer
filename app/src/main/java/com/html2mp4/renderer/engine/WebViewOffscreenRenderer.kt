@@ -3,18 +3,18 @@ package com.html2mp4.renderer.engine
 import android.annotation.SuppressLint
 import android.app.Presentation
 import android.content.Context
-import android.graphics.Bitmap
-import android.graphics.Canvas
 import android.graphics.Color
-import android.graphics.SurfaceTexture
+import android.graphics.drawable.ColorDrawable
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
 import android.net.Uri
 import android.os.Handler
 import android.os.Looper
-import android.view.Surface
+import android.util.DisplayMetrics
+import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
+import android.view.WindowManager
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
@@ -24,6 +24,7 @@ import android.widget.FrameLayout
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import com.html2mp4.renderer.model.RenderConfig
+import com.html2mp4.renderer.util.ChipsetOptimizer
 import com.html2mp4.renderer.util.MemoryGuard
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -91,7 +92,7 @@ class WebViewOffscreenRenderer(
             }
 
             withTimeoutOrNull(8_000L) { pageLoaded.await() }
-            delay(350L)
+            delay(500L)
             withContext(Dispatchers.Main) {
                 val probeCall = "${HtmlBridge.buildProbeOnlyScript()}; window.__html2mp4ProbeNow();"
                 webView?.evaluateJavascript(probeCall, null)
@@ -124,26 +125,26 @@ class WebViewOffscreenRenderer(
         val fps = config.frameRate.fps
         val totalFrames = ceil((durationMs / 1000.0) * fps).toInt().coerceAtLeast(fps)
 
+        val deviceProfile = ChipsetOptimizer.detect(context)
         val bridge = HtmlBridge(config.audioSampleRate.hz, config.audioChannels.count)
         val resourceHandler = SafWebResourceHandler(context, htmlUri, assetsTreeUri)
-        val pipeline = MediaCodecMuxerPipeline(config, tempOutputFile)
+        val pipeline = MediaCodecMuxerPipeline(config, deviceProfile, tempOutputFile)
         val pageLoaded = CompletableDeferred<Unit>()
 
         var webView: WebView? = null
         var virtualDisplay: VirtualDisplay? = null
         var presentation: Presentation? = null
-        var reusableBitmap: Bitmap? = null
-        var bitmapCanvas: Canvas? = null
+        var pulseView: View? = null
         var usingPresentation = false
 
         try {
             pipeline.prepare()
 
             withContext(Dispatchers.Main) {
+                runCatching { WebView.enableSlowWholeDocumentDraw() }
+
                 val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
-                val densityDpi = context.resources.displayMetrics.densityDpi
-                val probeTex = SurfaceTexture(0).apply { setDefaultBufferSize(width, height) }
-                val probeSurface = Surface(probeTex)
+                val densityDpi = DisplayMetrics.DENSITY_MEDIUM
 
                 val vdAttempt = runCatching {
                     dm.createVirtualDisplay(
@@ -151,7 +152,7 @@ class WebViewOffscreenRenderer(
                         width,
                         height,
                         densityDpi,
-                        probeSurface,
+                        pipeline.inputSurface,
                         DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or
                             DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION
                     )
@@ -167,6 +168,17 @@ class WebViewOffscreenRenderer(
                     val presAttempt = runCatching {
                         val disp = vdAttempt.display
                         val pres = Presentation(context, disp)
+                        pres.window?.apply {
+                            setBackgroundDrawable(ColorDrawable(Color.WHITE))
+                            setLayout(width, height)
+                            clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+                            addFlags(
+                                WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED or
+                                    WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE
+                            )
+                        }
+
                         val wv = createConfiguredWebView(
                             hostContext = pres.context,
                             bridge = bridge,
@@ -177,28 +189,41 @@ class WebViewOffscreenRenderer(
                             documentStartScript = docStartBootstrap
                         ) {
                             if (!pageLoaded.isCompleted) pageLoaded.complete(Unit)
+                        }.apply {
+                            setBackgroundColor(Color.WHITE)
                         }
+
+                        val ticker = View(pres.context).apply {
+                            setBackgroundColor(Color.TRANSPARENT)
+                            alpha = 0.01f
+                        }
+
                         val container = FrameLayout(pres.context).apply {
                             setBackgroundColor(Color.WHITE)
                             addView(
                                 wv,
-                                ViewGroup.LayoutParams(
+                                FrameLayout.LayoutParams(
                                     ViewGroup.LayoutParams.MATCH_PARENT,
                                     ViewGroup.LayoutParams.MATCH_PARENT
                                 )
                             )
+                            addView(
+                                ticker,
+                                FrameLayout.LayoutParams(1, 1, Gravity.TOP or Gravity.START)
+                            )
                         }
                         pres.setContentView(container)
                         pres.show()
-                        vdAttempt.setSurface(pipeline.inputSurface)
-                        Pair(pres, wv)
+                        pres.window?.setLayout(width, height)
+                        Triple(pres, wv, ticker)
                     }
 
                     if (presAttempt.isSuccess) {
-                        val (pres, wv) = presAttempt.getOrThrow()
+                        val (pres, wv, ticker) = presAttempt.getOrThrow()
                         virtualDisplay = vdAttempt
                         presentation = pres
                         webView = wv
+                        pulseView = ticker
                         usingPresentation = true
                     } else {
                         runCatching { vdAttempt.setSurface(null) }
@@ -206,13 +231,8 @@ class WebViewOffscreenRenderer(
                     }
                 }
 
-                runCatching { probeSurface.release() }
-                runCatching { probeTex.release() }
-
                 if (!usingPresentation) {
-                    // 100% crash-free Software Layer fallback with single reusable Bitmap
-                    reusableBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                    bitmapCanvas = Canvas(reusableBitmap!!)
+                    // Crash-free Software Layer fallback drawing directly to MediaCodec Surface
                     webView = createConfiguredWebView(
                         hostContext = context,
                         bridge = bridge,
@@ -224,6 +244,8 @@ class WebViewOffscreenRenderer(
                     ) {
                         if (!pageLoaded.isCompleted) pageLoaded.complete(Unit)
                     }.apply {
+                        setBackgroundColor(Color.WHITE)
+                        dispatchWindowVisibilityChanged(View.VISIBLE)
                         measure(
                             View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
                             View.MeasureSpec.makeMeasureSpec(height, View.MeasureSpec.EXACTLY)
@@ -237,7 +259,7 @@ class WebViewOffscreenRenderer(
             }
 
             withTimeoutOrNull(12_000L) { pageLoaded.await() }
-            delay(250L)
+            delay(300L)
 
             withContext(Dispatchers.Main) {
                 val bootstrap = HtmlBridge.buildBootstrapScript(
@@ -252,35 +274,32 @@ class WebViewOffscreenRenderer(
             }
 
             bridge.isCapturingAudio = !config.isAudioMuted
-            val frameDurationMs = 1000L / fps
+            val frameDurationMs = (1000L / fps).coerceAtLeast(16L)
             val startWallMs = System.currentTimeMillis()
             val silenceFrameBytes = ByteArray((config.audioSampleRate.hz / fps) * 2 * config.audioChannels.count)
+            var frameIdx = 0
 
-            for (frameIdx in 0 until totalFrames) {
-                if (!coroutineContext.isActive) break
+            while (coroutineContext.isActive) {
+                val nowElapsedMs = System.currentTimeMillis() - startWallMs
+                if (nowElapsedMs >= durationMs && frameIdx > 0) break
 
                 if (memoryGuard.shouldThrottleFrameQueue()) {
                     delay(8L)
                 }
 
-                val targetElapsedMs = (frameIdx + 1) * frameDurationMs
-                val actualElapsedMs = System.currentTimeMillis() - startWallMs
-                if (targetElapsedMs > actualElapsedMs) {
-                    delay(targetElapsedMs - actualElapsedMs)
-                }
-
                 withContext(Dispatchers.Main) {
                     val wv = webView ?: return@withContext
                     if (usingPresentation) {
+                        pulseView?.let { pv ->
+                            pv.alpha = if (frameIdx % 2 == 0) 0.01f else 0.02f
+                            pv.invalidate()
+                        }
                         wv.invalidate()
                     } else {
-                        val bmp = reusableBitmap ?: return@withContext
-                        val bCanvas = bitmapCanvas ?: return@withContext
-                        bmp.eraseColor(Color.WHITE)
-                        wv.draw(bCanvas)
                         val surfCanvas = pipeline.inputSurface.lockCanvas(null)
                         try {
-                            surfCanvas.drawBitmap(bmp, 0f, 0f, null)
+                            surfCanvas.drawColor(Color.WHITE)
+                            wv.draw(surfCanvas)
                         } finally {
                             pipeline.inputSurface.unlockCanvasAndPost(surfCanvas)
                         }
@@ -289,31 +308,38 @@ class WebViewOffscreenRenderer(
 
                 pipeline.drainVideo(endOfStream = false)
 
+                val afterFrameElapsedMs = System.currentTimeMillis() - startWallMs
                 if (!config.isAudioMuted) {
-                    var drainedAny = false
                     while (true) {
                         val chunk = bridge.audioChunkQueue.poll() ?: break
                         pipeline.feedAudioPcm(chunk.pcmBytes)
-                        drainedAny = true
                     }
-                    if (!drainedAny && frameIdx % 2 == 0) {
+                    var padGuard = 0
+                    while (pipeline.audioWrittenDurationMs() + 25L < afterFrameElapsedMs && padGuard < 4) {
                         pipeline.feedAudioPcm(silenceFrameBytes)
+                        padGuard++
                     }
                 }
 
-                if (frameIdx % 4 == 0 || frameIdx == totalFrames - 1) {
-                    val elapsed = (System.currentTimeMillis() - startWallMs).coerceAtLeast(1L)
-                    val pct = (((frameIdx + 1).toFloat() / totalFrames) * 100f).roundToInt().coerceIn(0, 99)
-                    val msPerFrame = elapsed.toDouble() / (frameIdx + 1)
-                    val remainingMs = ((totalFrames - (frameIdx + 1)) * msPerFrame).toLong().coerceAtLeast(0L)
+                frameIdx++
+                val targetNextMs = frameIdx * frameDurationMs
+                val sleepCheckElapsedMs = System.currentTimeMillis() - startWallMs
+                if (targetNextMs > sleepCheckElapsedMs && sleepCheckElapsedMs < durationMs) {
+                    delay((targetNextMs - sleepCheckElapsedMs).coerceAtMost(durationMs - sleepCheckElapsedMs))
+                }
+
+                if (frameIdx == 1 || frameIdx % 4 == 0 || afterFrameElapsedMs >= durationMs) {
+                    val elapsed = afterFrameElapsedMs.coerceAtLeast(1L)
+                    val pct = ((elapsed.toFloat() / durationMs.toFloat()) * 100f).roundToInt().coerceIn(0, 99)
+                    val remainingMs = (durationMs - elapsed).coerceAtLeast(0L)
                     onProgress(
                         RenderProgress(
                             percent = pct,
-                            currentFrame = frameIdx + 1,
+                            currentFrame = frameIdx,
                             totalFrames = totalFrames,
                             etaFormatted = formatEta(remainingMs),
                             elapsedMs = elapsed,
-                            phaseLabel = "Encoding Frame ${frameIdx + 1}/$totalFrames"
+                            phaseLabel = "Encoding Frame $frameIdx (~$totalFrames)"
                         )
                     )
                 }
@@ -323,7 +349,7 @@ class WebViewOffscreenRenderer(
             onProgress(
                 RenderProgress(
                     percent = 99,
-                    currentFrame = totalFrames,
+                    currentFrame = frameIdx,
                     totalFrames = totalFrames,
                     etaFormatted = "00:01",
                     elapsedMs = System.currentTimeMillis() - startWallMs,
@@ -342,7 +368,6 @@ class WebViewOffscreenRenderer(
                 runCatching { presentation?.dismiss() }
                 runCatching { virtualDisplay?.setSurface(null) }
                 runCatching { virtualDisplay?.release() }
-                runCatching { reusableBitmap?.recycle() }
             }
             pipeline.release()
         }

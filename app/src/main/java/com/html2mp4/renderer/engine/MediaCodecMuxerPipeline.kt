@@ -8,15 +8,20 @@ import android.media.MediaMuxer
 import android.view.Surface
 import com.html2mp4.renderer.model.AudioCodecOption
 import com.html2mp4.renderer.model.RenderConfig
+import com.html2mp4.renderer.model.VideoCodecOption
+import com.html2mp4.renderer.util.ChipsetOptimizer
+import com.html2mp4.renderer.util.DeviceProfile
 import java.io.File
 import java.nio.ByteBuffer
 
 /**
- * Hardware-accelerated MediaCodec + MediaMuxer pipeline tuned for Exynos 850 MFC.
+ * Hardware-accelerated MediaCodec + MediaMuxer pipeline auto-tuned across
+ * Exynos MFC, Qualcomm Snapdragon Venus, MediaTek VENC, Google Tensor, and ChromeOS x86_64.
  * Enforces strictly monotonic PTS and safe encoder fallback so MediaMuxer never throws.
  */
 class MediaCodecMuxerPipeline(
     private val config: RenderConfig,
+    private val deviceProfile: DeviceProfile,
     private val tempOutputFile: File
 ) {
     private val muxerLock = Any()
@@ -35,10 +40,21 @@ class MediaCodecMuxerPipeline(
     private val videoBufferInfo = MediaCodec.BufferInfo()
     private val audioBufferInfo = MediaCodec.BufferInfo()
 
+    private data class PendingMuxSample(
+        val isVideo: Boolean,
+        val bytes: ByteArray,
+        val info: MediaCodec.BufferInfo
+    )
+
     private val expectAudioTrack = !config.isAudioMuted
+    private val pendingSamples = ArrayList<PendingMuxSample>(32)
     private var totalAudioSamplesWritten = 0L
+    private var firstRawVideoPtsUs = -1L
     private var lastVideoPtsUs = -1L
     private var lastAudioPtsUs = -1L
+
+    fun audioWrittenDurationMs(): Long =
+        (totalAudioSamplesWritten * 1000L) / config.audioSampleRate.hz
 
     fun prepare() {
         val width = config.resolvedWidth
@@ -82,17 +98,35 @@ class MediaCodecMuxerPipeline(
 
     private fun configureVideoEncoderWithFallback(width: Int, height: Int): MediaCodec {
         val mime = config.videoCodec.mimeType
+        val preferredName = if (config.videoCodec == VideoCodecOption.H265) {
+            deviceProfile.preferredHevcEncoder
+        } else {
+            deviceProfile.preferredAvcEncoder
+        }
+        val alignedW = ChipsetOptimizer.alignDimension(width, deviceProfile.widthAlignment)
+        val alignedH = ChipsetOptimizer.alignDimension(height, deviceProfile.heightAlignment)
+
+        if (!preferredName.isNullOrBlank()) {
+            val namedAttempt = runCatching {
+                val fmt = createVideoFormat(mime, alignedW, alignedH)
+                MediaCodec.createByCodecName(preferredName).apply {
+                    configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                }
+            }
+            if (namedAttempt.isSuccess) return namedAttempt.getOrThrow()
+        }
+
         return try {
-            val fmt = createVideoFormat(mime, width, height)
+            val fmt = createVideoFormat(mime, alignedW, alignedH)
             MediaCodec.createEncoderByType(mime).apply {
                 configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             }
         } catch (_: Throwable) {
             // Safe fallback to H.264/AVC with 16-px macroblock alignment if custom size/HEVC is rejected
             val fallbackMime = MediaFormat.MIMETYPE_VIDEO_AVC
-            val alignedW = (((width + 8) / 16) * 16).coerceAtLeast(320)
-            val alignedH = (((height + 8) / 16) * 16).coerceAtLeast(240)
-            val fmt = createVideoFormat(fallbackMime, alignedW, alignedH)
+            val mbW = ChipsetOptimizer.alignDimension(width, 16).coerceAtLeast(320)
+            val mbH = ChipsetOptimizer.alignDimension(height, 16).coerceAtLeast(240)
+            val fmt = createVideoFormat(fallbackMime, mbW, mbH)
             MediaCodec.createEncoderByType(fallbackMime).apply {
                 configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
             }
@@ -108,6 +142,12 @@ class MediaCodecMuxerPipeline(
             setInteger(MediaFormat.KEY_BIT_RATE, config.resolvedVideoBitrateBps)
             setInteger(MediaFormat.KEY_FRAME_RATE, config.frameRate.fps)
             setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1)
+            runCatching {
+                setInteger(
+                    MediaFormat.KEY_BITRATE_MODE,
+                    MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_VBR
+                )
+            }
         }
     }
 
@@ -146,15 +186,33 @@ class MediaCodecMuxerPipeline(
                     val encodedData = videoCodec.getOutputBuffer(status)
                     if (encodedData != null && (videoBufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
                         if (videoBufferInfo.size > 0) {
+                            val rawPtsUs = videoBufferInfo.presentationTimeUs
+                            if (firstRawVideoPtsUs < 0L) {
+                                firstRawVideoPtsUs = rawPtsUs
+                            }
+                            var normalizedPtsUs = (rawPtsUs - firstRawVideoPtsUs).coerceAtLeast(0L)
+                            val minStepUs = (1_000_000L / config.frameRate.fps).coerceAtLeast(1_000L)
+                            if (normalizedPtsUs <= lastVideoPtsUs) {
+                                normalizedPtsUs = lastVideoPtsUs + minStepUs
+                            } else if (lastVideoPtsUs >= 0L && (normalizedPtsUs - lastVideoPtsUs) > 2_000_000L) {
+                                normalizedPtsUs = lastVideoPtsUs + minStepUs
+                            }
+                            lastVideoPtsUs = normalizedPtsUs
+
+                            encodedData.position(videoBufferInfo.offset)
+                            encodedData.limit(videoBufferInfo.offset + videoBufferInfo.size)
+
                             synchronized(muxerLock) {
                                 if (muxerStarted) {
-                                    if (videoBufferInfo.presentationTimeUs <= lastVideoPtsUs) {
-                                        videoBufferInfo.presentationTimeUs = lastVideoPtsUs + 1
-                                    }
-                                    lastVideoPtsUs = videoBufferInfo.presentationTimeUs
-                                    encodedData.position(videoBufferInfo.offset)
-                                    encodedData.limit(videoBufferInfo.offset + videoBufferInfo.size)
+                                    videoBufferInfo.presentationTimeUs = normalizedPtsUs
                                     muxer!!.writeSampleData(videoTrackIndex, encodedData, videoBufferInfo)
+                                } else if (pendingSamples.size < 96) {
+                                    val copy = ByteArray(videoBufferInfo.size)
+                                    encodedData.get(copy)
+                                    val infoCopy = MediaCodec.BufferInfo().apply {
+                                        set(0, copy.size, normalizedPtsUs, videoBufferInfo.flags)
+                                    }
+                                    pendingSamples.add(PendingMuxSample(isVideo = true, bytes = copy, info = infoCopy))
                                 }
                             }
                         }
@@ -228,15 +286,26 @@ class MediaCodecMuxerPipeline(
                     val encodedData: ByteBuffer? = codec.getOutputBuffer(status)
                     if (encodedData != null && (audioBufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) == 0) {
                         if (audioBufferInfo.size > 0) {
+                            var normalizedAudioPtsUs = audioBufferInfo.presentationTimeUs.coerceAtLeast(0L)
+                            if (normalizedAudioPtsUs <= lastAudioPtsUs) {
+                                normalizedAudioPtsUs = lastAudioPtsUs + 1
+                            }
+                            lastAudioPtsUs = normalizedAudioPtsUs
+
+                            encodedData.position(audioBufferInfo.offset)
+                            encodedData.limit(audioBufferInfo.offset + audioBufferInfo.size)
+
                             synchronized(muxerLock) {
                                 if (muxerStarted) {
-                                    if (audioBufferInfo.presentationTimeUs <= lastAudioPtsUs) {
-                                        audioBufferInfo.presentationTimeUs = lastAudioPtsUs + 1
-                                    }
-                                    lastAudioPtsUs = audioBufferInfo.presentationTimeUs
-                                    encodedData.position(audioBufferInfo.offset)
-                                    encodedData.limit(audioBufferInfo.offset + audioBufferInfo.size)
+                                    audioBufferInfo.presentationTimeUs = normalizedAudioPtsUs
                                     muxer!!.writeSampleData(audioTrackIndex, encodedData, audioBufferInfo)
+                                } else if (pendingSamples.size < 96) {
+                                    val copy = ByteArray(audioBufferInfo.size)
+                                    encodedData.get(copy)
+                                    val infoCopy = MediaCodec.BufferInfo().apply {
+                                        set(0, copy.size, normalizedAudioPtsUs, audioBufferInfo.flags)
+                                    }
+                                    pendingSamples.add(PendingMuxSample(isVideo = false, bytes = copy, info = infoCopy))
                                 }
                             }
                         }
@@ -255,6 +324,13 @@ class MediaCodecMuxerPipeline(
         if (videoReady && audioReady) {
             muxer?.start()
             muxerStarted = true
+            for (sample in pendingSamples) {
+                val trackIdx = if (sample.isVideo) videoTrackIndex else audioTrackIndex
+                if (trackIdx >= 0) {
+                    muxer?.writeSampleData(trackIdx, ByteBuffer.wrap(sample.bytes), sample.info)
+                }
+            }
+            pendingSamples.clear()
         }
     }
 

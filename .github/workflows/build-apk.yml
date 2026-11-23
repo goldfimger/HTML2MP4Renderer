@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   build-android-apk:
-    name: Compile Android 15 APK (ARM64-v8a)
+    name: Compile Android 15 APK (ARM64 + ARMv7 + x86_64)
     runs-on: ubuntu-latest
 
     steps:
@@ -45,7 +45,7 @@ jobs:
           fi
           chmod +x ./gradlew
 
-      - name: Build Debug APK (arm64-v8a)
+      - name: Build Debug APK
         run: ./gradlew assembleDebug --no-daemon --stacktrace
 
       - name: Build Release APK (Unsigned / CI Test)
@@ -55,16 +55,16 @@ jobs:
       - name: Rename Output APKs for Distribution
         run: |
           mkdir -p dist-apk
-          cp app/build/outputs/apk/debug/*.apk dist-apk/HTML2MP4-Renderer-v1.0.0-arm64-v8a-debug.apk
+          cp app/build/outputs/apk/debug/*.apk dist-apk/HTML2MP4-Renderer-v1.1.0-universal-debug.apk
           if [ -d app/build/outputs/apk/release ]; then
-            find app/build/outputs/apk/release -name "*.apk" -exec cp {} dist-apk/HTML2MP4-Renderer-v1.0.0-arm64-v8a-release-unsigned.apk \;
+            find app/build/outputs/apk/release -name "*.apk" -exec cp {} dist-apk/HTML2MP4-Renderer-v1.1.0-universal-release-unsigned.apk \;
           fi
           ls -lh dist-apk/
 
       - name: Upload APK to GitHub Actions Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: HTML2MP4-Renderer-Android15-arm64-v8a
+          name: HTML2MP4-Renderer-Android15-Universal
           path: dist-apk/*.apk
           retention-days: 30
 
@@ -72,13 +72,13 @@ jobs:
         if: github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.${{ github.run_number }}
-          name: HTML2MP4 Renderer v1.0.${{ github.run_number }} (Android 15 · Exynos 850)
+          tag_name: v1.1.${{ github.run_number }}
+          name: HTML2MP4 Renderer v1.1.${{ github.run_number }} (Android 15 · Multi-Chipset & ChromeOS)
           body: |
-            Automated build for **HTML2MP4 Renderer** optimized for **Exynos 850 (ARM64-v8a)** on **Android 15 (API 35)**.
+            Automated build for **HTML2MP4 Renderer** (**Exynos 850/2xxx**, **Snapdragon**, **MediaTek**, **Google Tensor**, **Android Tablets**, and **Chromebook / Googlebook x86_64**).
             - Hardware MediaCodec (H.264 / HEVC) + MediaMuxer zero-copy Surface pipeline
             - Android 15 ForegroundService (mediaProcessing) compliant
-            - Material You (Monet) Jetpack Compose UI
+            - Material You (Monet) Jetpack Compose UI with responsive Tablet/Chromebook NavigationRail
           files: dist-apk/*.apk
           draft: false
           prerelease: false

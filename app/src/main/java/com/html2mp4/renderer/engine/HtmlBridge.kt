@@ -116,6 +116,18 @@ class HtmlBridge(
                   if (!isNaN(sec) && sec > 0) maxMs = Math.max(maxMs, Math.round(sec * 1000));
                 }
 
+                if (window.OPENER) {
+                  const opDur = Number(window.OPENER.DURATION || window.OPENER.duration || 0);
+                  if (isFinite(opDur) && opDur > 0) {
+                    maxMs = Math.max(maxMs, Math.round(opDur * 1000));
+                  } else if (window.OPENER.tl && typeof window.OPENER.tl.duration === 'function') {
+                    const tlDur = Number(window.OPENER.tl.duration());
+                    if (isFinite(tlDur) && tlDur > 0) {
+                      maxMs = Math.max(maxMs, Math.round(tlDur * 1000));
+                    }
+                  }
+                }
+
                 document.querySelectorAll('video, audio').forEach((el) => {
                   if (el.duration && isFinite(el.duration) && el.duration > 0) {
                     maxMs = Math.max(maxMs, Math.round(el.duration * 1000));
@@ -139,7 +151,7 @@ class HtmlBridge(
 
                 const metaRes = document.querySelector('meta[name="html2mp4-resolution"]');
                 if (metaRes && metaRes.content) {
-                  const m = metaRes.content.match(/(\d+)\s*[xX*]\s*(\d+)/);
+                  const m = metaRes.content.match(/(\d+)\s*[xX*×,]\s*(\d+)/);
                   if (m) {
                     detW = parseInt(m[1], 10);
                     detH = parseInt(m[2], 10);
@@ -150,8 +162,17 @@ class HtmlBridge(
                   const metaOrient = document.querySelector('meta[name="html2mp4-orientation"]');
                   if (metaOrient && metaOrient.content) {
                     const v = metaOrient.content.toLowerCase().trim();
-                    if (v === 'portrait' || v === 'vertical') { detW = 720; detH = 1280; }
-                    else if (v === 'landscape' || v === 'horizontal') { detW = 1280; detH = 720; }
+                    if (v === 'portrait' || v === 'vertical' || v === 'vertikal') { detW = 720; detH = 1280; }
+                    else if (v === 'landscape' || v === 'horizontal' || v === 'lanskap') { detW = 1280; detH = 720; }
+                  }
+                }
+
+                if ((!detW || !detH) && window.OPENER) {
+                  const ow = Number(window.OPENER.W || window.OPENER.width || 0);
+                  const oh = Number(window.OPENER.H || window.OPENER.height || 0);
+                  if (ow >= 120 && oh >= 120) {
+                    detW = Math.round(ow);
+                    detH = Math.round(oh);
                   }
                 }
 
@@ -176,61 +197,88 @@ class HtmlBridge(
                 }
 
                 if (!detW || !detH) {
-                  const cvs = document.querySelector('canvas');
-                  if (cvs && cvs.width > 0 && cvs.height > 0) {
-                    const cr = cvs.getBoundingClientRect();
-                    if (cr.width > 0 && cr.height > 0 && Math.abs(cr.width - cr.height) > 20) {
-                      detW = Math.round(cr.width);
-                      detH = Math.round(cr.height);
-                    } else {
-                      detW = cvs.width;
-                      detH = cvs.height;
+                  let bestArea = 0;
+                  document.querySelectorAll('canvas').forEach((cvs) => {
+                    if (cvs.width >= 120 && cvs.height >= 120) {
+                      const area = cvs.width * cvs.height;
+                      if (area > bestArea) {
+                        bestArea = area;
+                        detW = cvs.width;
+                        detH = cvs.height;
+                      }
                     }
-                  }
+                  });
                 }
 
                 if (!detW || !detH) {
-                  const svg = document.querySelector('svg[viewBox]');
-                  if (svg) {
-                    const vb = svg.getAttribute('viewBox').trim().split(/[\s,]+/);
-                    if (vb.length === 4) {
-                      const sw = parseFloat(vb[2]);
-                      const sh = parseFloat(vb[3]);
-                      if (sw > 0 && sh > 0) {
+                  let bestSvgArea = 0;
+                  document.querySelectorAll('svg').forEach((svg) => {
+                    let sw = 0;
+                    let sh = 0;
+                    const vb = svg.getAttribute('viewBox');
+                    if (vb) {
+                      const parts = vb.trim().split(/[\s,]+/);
+                      if (parts.length === 4) {
+                        sw = parseFloat(parts[2]) || 0;
+                        sh = parseFloat(parts[3]) || 0;
+                      }
+                    }
+                    if (!sw || !sh) {
+                      const aw = svg.getAttribute('width');
+                      const ah = svg.getAttribute('height');
+                      if (aw && ah && !aw.includes('%') && !ah.includes('%')) {
+                        sw = parseFloat(aw) || 0;
+                        sh = parseFloat(ah) || 0;
+                      }
+                    }
+                    if (!sw || !sh) {
+                      try {
+                        const cs = getComputedStyle(svg);
+                        sw = parseFloat(cs.width) || 0;
+                        sh = parseFloat(cs.height) || 0;
+                      } catch (e) {}
+                    }
+                    if (sw >= 120 && sh >= 120 && Math.abs(sw - sh) >= 16) {
+                      const area = sw * sh;
+                      if (area > bestSvgArea) {
+                        bestSvgArea = area;
                         detW = Math.round(sw);
                         detH = Math.round(sh);
                       }
                     }
-                  }
+                  });
                 }
 
                 if (!detW || !detH) {
-                  const candidates = [
-                    document.body && document.body.firstElementChild,
-                    document.body,
-                    document.documentElement
-                  ].filter(Boolean);
+                  const stageEls = Array.from(
+                    document.querySelectorAll('#stage, #world, #app, #scene, #canvas, .stage, main, body > div')
+                  );
+                  const candidates = stageEls.concat(
+                    [document.body, document.documentElement].filter(Boolean)
+                  );
 
                   for (const el of candidates) {
+                    if (!el) continue;
                     try {
                       const cs = getComputedStyle(el);
-                      const pw = parseFloat(cs.width);
-                      const ph = parseFloat(cs.height);
                       if (cs.aspectRatio && cs.aspectRatio.includes('/')) {
                         const parts = cs.aspectRatio.split('/').map(Number);
-                        if (parts.length === 2 && parts[0] > 0 && parts[1] > 0) {
-                          if (parts[1] > parts[0]) { detW = 720; detH = 1280; }
-                          else { detW = 1280; detH = 720; }
+                        if (parts.length === 2 && parts[0] > 0 && parts[1] > 0 && Math.abs(parts[0] - parts[1]) > 0.05) {
+                          if (parts[1] > parts[0]) { detW = 1080; detH = Math.round((1080 * parts[1]) / parts[0]); }
+                          else { detH = 720; detW = Math.round((720 * parts[0]) / parts[1]); }
                           break;
                         }
                       }
+                      const pw = parseFloat(cs.width);
+                      const ph = parseFloat(cs.height);
+                      if (pw >= 120 && ph >= 120 && Math.abs(pw - ph) >= 16 && !(pw === 1000 && ph === 1000)) {
+                        detW = Math.round(pw);
+                        detH = Math.round(ph);
+                        break;
+                      }
                       const rect = el.getBoundingClientRect();
-                      if (rect.width >= 200 && rect.height >= 200) {
-                        if (rect.height > rect.width * 1.15) {
-                          detW = Math.round(rect.width);
-                          detH = Math.round(rect.height);
-                          break;
-                        } else if (rect.width > rect.height * 1.15 && pw !== 1000) {
+                      if (rect.width >= 120 && rect.height >= 120 && Math.abs(rect.width - rect.height) >= 16) {
+                        if (!(Math.round(rect.width) === 1000 && Math.round(rect.height) === 1000)) {
                           detW = Math.round(rect.width);
                           detH = Math.round(rect.height);
                           break;
@@ -296,21 +344,30 @@ class HtmlBridge(
 
                     processor.onaudioprocess = function(ev) {
                       if (!window.__html2mp4Active) return;
-                      const outFrames = ev.inputBuffer.length;
+                      const srcRate = ctx.sampleRate || TARGET_SR;
+                      const inLen = ev.inputBuffer.length;
                       const chCount = Math.min(TARGET_CH, ev.inputBuffer.numberOfChannels);
-                      const int16 = new Int16Array(outFrames * TARGET_CH);
-                      for (let i = 0; i < outFrames; i++) {
+                      const ratio = srcRate / TARGET_SR;
+                      const outLen = Math.max(1, Math.round(inLen / ratio));
+                      const int16 = new Int16Array(outLen * TARGET_CH);
+                      for (let i = 0; i < outLen; i++) {
+                        const srcPos = Math.min(inLen - 1, i * ratio);
+                        const idx0 = Math.floor(srcPos);
+                        const idx1 = Math.min(inLen - 1, idx0 + 1);
+                        const frac = srcPos - idx0;
                         for (let c = 0; c < TARGET_CH; c++) {
                           const srcCh = c < chCount ? c : 0;
-                          const sample = Math.max(-1, Math.min(1, ev.inputBuffer.getChannelData(srcCh)[i]));
-                          int16[i * TARGET_CH + c] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
+                          const chData = ev.inputBuffer.getChannelData(srcCh);
+                          const sample = chData[idx0] * (1 - frac) + chData[idx1] * frac;
+                          const clamped = Math.max(-1, Math.min(1, sample));
+                          int16[i * TARGET_CH + c] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7FFF;
                         }
                       }
                       const ptsMs = Math.max(0, Math.round(performance.now() - startWall));
                       if (window.AndroidHtml2Mp4) {
                         window.AndroidHtml2Mp4.onAudioPcmChunk(
                           arrayBufferToBase64(int16.buffer),
-                          ctx.sampleRate || TARGET_SR,
+                          TARGET_SR,
                           TARGET_CH,
                           ptsMs
                         );
@@ -369,6 +426,20 @@ class HtmlBridge(
                     el.play().catch(() => {});
                   } catch (e) {}
                 });
+                try {
+                  window.dispatchEvent(new Event('pointerdown'));
+                  if (document.body) {
+                    document.body.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+                    document.body.click();
+                  }
+                } catch (e) {}
+                try {
+                  if (window.OPENER && window.OPENER.tl && typeof window.OPENER.tl.play === 'function') {
+                    if (window.OPENER.tl.paused()) {
+                      window.OPENER.tl.play(0);
+                    }
+                  }
+                } catch (e) {}
               };
             })();
         """.trimIndent()

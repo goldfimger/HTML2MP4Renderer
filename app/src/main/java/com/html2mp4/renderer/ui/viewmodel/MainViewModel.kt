@@ -1,6 +1,7 @@
 package com.html2mp4.renderer.ui.viewmodel
 
 import android.app.Application
+import android.content.Context
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
@@ -9,6 +10,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.html2mp4.renderer.data.RenderRepository
 import com.html2mp4.renderer.engine.WebViewOffscreenRenderer
+import com.html2mp4.renderer.model.AppLanguage
 import com.html2mp4.renderer.model.AudioBitrateOption
 import com.html2mp4.renderer.model.AudioChannelOption
 import com.html2mp4.renderer.model.AudioCodecOption
@@ -24,6 +26,8 @@ import com.html2mp4.renderer.model.VideoBitratePreset
 import com.html2mp4.renderer.model.VideoCodecOption
 import com.html2mp4.renderer.model.VideoOrientation
 import com.html2mp4.renderer.service.RenderForegroundService
+import com.html2mp4.renderer.util.ChipsetOptimizer
+import com.html2mp4.renderer.util.DeviceProfile
 import com.html2mp4.renderer.util.MemoryGuard
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -33,12 +37,18 @@ import kotlinx.coroutines.launch
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
+    private val prefs = application.getSharedPreferences("html2mp4_prefs", Context.MODE_PRIVATE)
     private val repository = RenderRepository(application)
     private val memoryGuard = MemoryGuard(application)
     private val probeRenderer = WebViewOffscreenRenderer(application, memoryGuard)
 
-    private val _themeMode = MutableStateFlow(ThemeMode.SYSTEM)
+    val deviceProfile: DeviceProfile = ChipsetOptimizer.detect(application)
+
+    private val _themeMode = MutableStateFlow(loadSavedThemeMode())
     val themeMode: StateFlow<ThemeMode> = _themeMode.asStateFlow()
+
+    private val _appLanguage = MutableStateFlow(loadSavedLanguage())
+    val appLanguage: StateFlow<AppLanguage> = _appLanguage.asStateFlow()
 
     private val _projectMetadata = MutableStateFlow<HtmlProjectMetadata?>(null)
     val projectMetadata: StateFlow<HtmlProjectMetadata?> = _projectMetadata.asStateFlow()
@@ -68,13 +78,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun loadSavedThemeMode(): ThemeMode {
+        val raw = prefs.getString("theme_mode", null) ?: return ThemeMode.SYSTEM
+        return ThemeMode.entries.firstOrNull { it.name == raw } ?: ThemeMode.SYSTEM
+    }
+
+    private fun loadSavedLanguage(): AppLanguage {
+        val raw = prefs.getString("app_language", null) ?: return AppLanguage.INDONESIAN
+        return AppLanguage.entries.firstOrNull { it.name == raw } ?: AppLanguage.INDONESIAN
+    }
+
+    fun setAppLanguage(language: AppLanguage) {
+        _appLanguage.value = language
+        prefs.edit().putString("app_language", language.name).apply()
+    }
+
     fun cycleThemeMode() {
         _themeMode.update { current ->
-            when (current) {
+            val next = when (current) {
                 ThemeMode.SYSTEM -> ThemeMode.LIGHT
                 ThemeMode.LIGHT -> ThemeMode.DARK
                 ThemeMode.DARK -> ThemeMode.SYSTEM
             }
+            prefs.edit().putString("theme_mode", next.name).apply()
+            next
         }
     }
 

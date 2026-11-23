@@ -9,8 +9,8 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * Guards Exynos 850 devices (typically 3–4 GB RAM) from OOM or LMK kills
- * by tracking system memory pressure and enforcing safe queue limits.
+ * Guards devices across 3-4 GB entry SoCs (Exynos 850 / Helio) and 6-16 GB flagship
+ * Snapdragon/Tensor phones, Tablets, and Chromebooks by dynamically scaling heap/queue thresholds.
  */
 class MemoryGuard(private val context: Context) : ComponentCallbacks2 {
 
@@ -19,6 +19,12 @@ class MemoryGuard(private val context: Context) : ComponentCallbacks2 {
 
     private val _isLowMemory = MutableStateFlow(false)
     val isLowMemory: StateFlow<Boolean> = _isLowMemory.asStateFlow()
+
+    private val isTightRamDevice: Boolean by lazy {
+        val memInfo = ActivityManager.MemoryInfo()
+        activityManager.getMemoryInfo(memInfo)
+        (memInfo.totalMem / (1024L * 1024L)) <= 4500L
+    }
 
     fun register() {
         context.registerComponentCallbacks(this)
@@ -37,13 +43,15 @@ class MemoryGuard(private val context: Context) : ComponentCallbacks2 {
     fun isSafeToStart1080p(): Boolean {
         val memInfo = ActivityManager.MemoryInfo()
         activityManager.getMemoryInfo(memInfo)
-        return !memInfo.lowMemory && (memInfo.availMem / (1024L * 1024L)) >= 280L
+        val minRequiredMb = if (isTightRamDevice) 280L else 220L
+        return !memInfo.lowMemory && (memInfo.availMem / (1024L * 1024L)) >= minRequiredMb
     }
 
     fun shouldThrottleFrameQueue(): Boolean {
         val memInfo = ActivityManager.MemoryInfo()
         activityManager.getMemoryInfo(memInfo)
-        val low = memInfo.lowMemory || (memInfo.availMem / (1024L * 1024L)) < 180L
+        val throttleMb = if (isTightRamDevice) 180L else 120L
+        val low = memInfo.lowMemory || (memInfo.availMem / (1024L * 1024L)) < throttleMb
         _isLowMemory.value = low
         return low
     }

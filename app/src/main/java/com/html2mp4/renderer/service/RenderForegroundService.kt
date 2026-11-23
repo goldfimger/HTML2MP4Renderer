@@ -20,6 +20,7 @@ import com.html2mp4.renderer.data.RenderRepository
 import com.html2mp4.renderer.engine.WebViewOffscreenRenderer
 import com.html2mp4.renderer.model.RenderConfig
 import com.html2mp4.renderer.model.RenderStatus
+import com.html2mp4.renderer.util.ChipsetOptimizer
 import com.html2mp4.renderer.util.MemoryGuard
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -78,10 +79,11 @@ class RenderForegroundService : Service() {
     }
 
     private fun startAsMediaProcessingForeground() {
+        val profile = ChipsetOptimizer.detect(applicationContext)
         val notification = buildProgressNotification(
             percent = 0,
             eta = "--:--",
-            phase = "Menyiapkan Hardware MediaCodec Exynos 850..."
+            phase = "Menyiapkan Hardware MediaCodec (${profile.socFamily.displayName})..."
         )
         val fgsType = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.VANILLA_ICE_CREAM) {
             ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING

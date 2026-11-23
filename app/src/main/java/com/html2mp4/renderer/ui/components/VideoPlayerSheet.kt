@@ -1,13 +1,16 @@
 package com.html2mp4.renderer.ui.components
 
 import android.content.Intent
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.ui.graphics.Color
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.OpenInNew
@@ -33,9 +36,11 @@ import androidx.media3.common.MediaItem
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.PlayerView
 import com.html2mp4.renderer.model.RenderedVideoItem
+import com.html2mp4.renderer.ui.i18n.AppStrings
 
 @Composable
 fun VideoPlayerDialog(
+    strings: AppStrings,
     video: RenderedVideoItem,
     onDismiss: () -> Unit
 ) {
@@ -78,28 +83,28 @@ fun VideoPlayerDialog(
                         modifier = Modifier.weight(1f)
                     )
                     IconButton(onClick = onDismiss) {
-                        Icon(Icons.Rounded.Close, contentDescription = "Tutup pemutar")
+                        Icon(Icons.Rounded.Close, contentDescription = strings.closePlayerCd)
                     }
                 }
 
-                val videoAspect = if (video.width > 0 && video.height > 0) {
-                    (video.width.toFloat() / video.height.toFloat()).coerceIn(0.45f, 2.4f)
-                } else {
-                    16f / 9f
-                }
-
-                AndroidView(
-                    factory = { ctx ->
-                        PlayerView(ctx).apply {
-                            player = exoPlayer
-                            useController = true
-                        }
-                    },
+                val isPortrait = video.height > video.width && video.width > 0
+                Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .heightIn(max = 460.dp)
-                        .aspectRatio(videoAspect)
-                )
+                        .height(if (isPortrait) 400.dp else 240.dp)
+                        .background(Color.Black),
+                    contentAlignment = Alignment.Center
+                ) {
+                    AndroidView(
+                        factory = { ctx ->
+                            PlayerView(ctx).apply {
+                                player = exoPlayer
+                                useController = true
+                            }
+                        },
+                        modifier = Modifier.fillMaxSize()
+                    )
+                }
 
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
@@ -111,11 +116,11 @@ fun VideoPlayerDialog(
                                 setDataAndType(video.uri, "video/mp4")
                                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                             }
-                            runCatching { context.startActivity(Intent.createChooser(intent, "Putar dengan")) }
+                            runCatching { context.startActivity(Intent.createChooser(intent, strings.playWithTitle)) }
                         }
                     ) {
                         Icon(Icons.Rounded.OpenInNew, contentDescription = null)
-                        Text(" Pemutar Sistem")
+                        Text(" ${strings.systemPlayerButton}")
                     }
                 }
             }

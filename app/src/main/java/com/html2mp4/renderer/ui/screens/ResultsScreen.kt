@@ -17,6 +17,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -40,10 +43,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.html2mp4.renderer.model.RenderedVideoItem
+import com.html2mp4.renderer.ui.i18n.AppStrings
 import java.util.Locale
 
 @Composable
 fun ResultsScreen(
+    strings: AppStrings,
+    isWideScreen: Boolean,
     videos: List<RenderedVideoItem>,
     thumbnails: Map<Uri, Bitmap?>,
     onRefresh: () -> Unit,
@@ -58,12 +64,12 @@ fun ResultsScreen(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = "Video Selesai (${videos.size})",
+                text = strings.resultsCountFormat(videos.size),
                 style = MaterialTheme.typography.titleMedium,
                 fontWeight = FontWeight.SemiBold
             )
             IconButton(onClick = onRefresh) {
-                Icon(Icons.Rounded.Refresh, contentDescription = "Segarkan daftar")
+                Icon(Icons.Rounded.Refresh, contentDescription = strings.refreshListCd)
             }
         }
 
@@ -80,14 +86,31 @@ fun ResultsScreen(
                         tint = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                     Text(
-                        text = "Belum ada video MP4",
+                        text = strings.noVideosTitle,
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.SemiBold
                     )
                     Text(
-                        text = "Hasil render dari /Movies/HTML2MP4/ akan muncul di sini.",
+                        text = strings.noVideosSubtitle,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        } else if (isWideScreen) {
+            LazyVerticalGrid(
+                columns = GridCells.Adaptive(minSize = 320.dp),
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                gridItems(videos, key = { it.uri.toString() }) { item ->
+                    RenderedVideoCard(
+                        strings = strings,
+                        item = item,
+                        thumbnail = thumbnails[item.uri],
+                        onPlay = { onPlayVideo(item) }
                     )
                 }
             }
@@ -99,6 +122,7 @@ fun ResultsScreen(
             ) {
                 items(videos, key = { it.uri.toString() }) { item ->
                     RenderedVideoCard(
+                        strings = strings,
                         item = item,
                         thumbnail = thumbnails[item.uri],
                         onPlay = { onPlayVideo(item) }
@@ -111,6 +135,7 @@ fun ResultsScreen(
 
 @Composable
 private fun RenderedVideoCard(
+    strings: AppStrings,
     item: RenderedVideoItem,
     thumbnail: Bitmap?,
     onPlay: () -> Unit
@@ -172,7 +197,7 @@ private fun RenderedVideoCard(
             Spacer(Modifier.width(8.dp))
 
             FilledTonalIconButton(onClick = onPlay) {
-                Icon(Icons.Rounded.PlayArrow, contentDescription = "Putar Video")
+                Icon(Icons.Rounded.PlayArrow, contentDescription = strings.playVideoCd)
             }
         }
     }

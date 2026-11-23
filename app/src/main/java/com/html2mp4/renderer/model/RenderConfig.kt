@@ -17,12 +17,12 @@ enum class ResolutionPreset(val label: String, val longSide: Int, val shortSide:
 
 enum class FrameRateOption(val fps: Int, val label: String) {
     FPS_24(24, "24 FPS (Sinematik)"),
-    FPS_30(30, "30 FPS (Optimal Exynos 850)"),
+    FPS_30(30, "30 FPS (Optimal Hardware)"),
     FPS_60(60, "60 FPS (Halus)")
 }
 
 enum class VideoCodecOption(val label: String, val mimeType: String) {
-    H264("H.264 / AVC (Optimal Exynos 850)", MediaFormat.MIMETYPE_VIDEO_AVC),
+    H264("H.264 / AVC (Optimal Hardware)", MediaFormat.MIMETYPE_VIDEO_AVC),
     H265("H.265 / HEVC (Efisien)", MediaFormat.MIMETYPE_VIDEO_HEVC)
 }
 
@@ -59,6 +59,12 @@ enum class ThemeMode(val label: String) {
     SYSTEM("Otomatis Sistem"),
     LIGHT("Mode Terang"),
     DARK("Mode Gelap")
+}
+
+enum class AppLanguage(val label: String) {
+    SYSTEM("Sistem / System"),
+    INDONESIAN("Bahasa Indonesia"),
+    ENGLISH("English")
 }
 
 data class HtmlProjectMetadata(

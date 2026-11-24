@@ -414,9 +414,9 @@ fun ProjectScreen(
                             }
                             TextButton(onClick = onDismissStatus) { Text(strings.closeButton) }
                         }
-                        if (!renderStatus.technicalDetail.isNullOrBlank()) {
+                        renderStatus.technicalDetail?.takeIf { it.isNotBlank() }?.let { detail ->
                             Text(
-                                text = renderStatus.technicalDetail,
+                                text = detail,
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onErrorContainer
                             )

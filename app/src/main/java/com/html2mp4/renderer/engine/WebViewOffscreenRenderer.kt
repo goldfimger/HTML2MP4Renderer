@@ -44,6 +44,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.File
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.coroutineContext
 import kotlin.math.ceil
 import kotlin.math.roundToInt
@@ -143,7 +144,7 @@ class WebViewOffscreenRenderer(
         val pipeline = MediaCodecMuxerPipeline(config, deviceProfile, tempOutputFile)
         val eglRenderer = EglSurfaceRenderer()
         val pageLoaded = CompletableDeferred<Unit>()
-        @Volatile var fatalWebViewError: String? = null
+        val fatalWebViewError = AtomicReference<String?>(null)
         var currentPhase = RenderPhase.INITIALIZING
         memoryGuard.resetSessionStats()
 
@@ -174,8 +175,7 @@ class WebViewOffscreenRenderer(
                 captureAudio = !config.isAudioMuted
             )
             val docStartScript = if (isDeterministic) {
-                DeterministicTimelineEngine.buildVirtualClockBootstrap(fps) + "
-;" + audioBootstrap
+                DeterministicTimelineEngine.buildVirtualClockBootstrap(fps) + "\n;" + audioBootstrap
             } else {
                 audioBootstrap
             }
@@ -226,7 +226,7 @@ class WebViewOffscreenRenderer(
                             requireUserGesture = false,
                             documentStartScript = docStartScript,
                             onFatalError = { err ->
-                                fatalWebViewError = err
+                                fatalWebViewError.set(err)
                                 if (!pageLoaded.isCompleted) pageLoaded.complete(Unit)
                             }
                         ) {
@@ -284,7 +284,7 @@ class WebViewOffscreenRenderer(
                         requireUserGesture = false,
                         documentStartScript = docStartScript,
                         onFatalError = { err ->
-                            fatalWebViewError = err
+                            fatalWebViewError.set(err)
                             if (!pageLoaded.isCompleted) pageLoaded.complete(Unit)
                         }
                     ) {
@@ -304,12 +304,14 @@ class WebViewOffscreenRenderer(
                 webView?.loadUrl(SafWebResourceHandler.ENTRY_URL)
             }
 
-            withTimeoutOrNull(12_000L) { pageLoaded.await() }
-                ?: throw RenderPipelineException(
+            val loaded = withTimeoutOrNull(12_000L) { pageLoaded.await() }
+            if (loaded == null) {
+                throw RenderPipelineException(
                     phase = RenderPhase.WEBVIEW_LOAD,
                     technicalDetail = "Timeout memuat dokumen HTML di WebView (>12 detik)."
                 )
-            fatalWebViewError?.let { err ->
+            }
+            fatalWebViewError.get()?.let { err ->
                 throw RenderPipelineException(phase = RenderPhase.WEBVIEW_LOAD, technicalDetail = err)
             }
             delay(150L)
@@ -347,7 +349,7 @@ class WebViewOffscreenRenderer(
                 }
 
                 while (coroutineContext.isActive && timelineEngine.hasNextFrame()) {
-                    fatalWebViewError?.let { err ->
+                    fatalWebViewError.get()?.let { err ->
                         throw RenderPipelineException(phase = RenderPhase.FRAME_CAPTURE, technicalDetail = err)
                     }
                     val tick = timelineEngine.advance() ?: break
@@ -478,7 +480,7 @@ class WebViewOffscreenRenderer(
                 var frameIdx = 0
 
                 while (coroutineContext.isActive) {
-                    fatalWebViewError?.let { err ->
+                    fatalWebViewError.get()?.let { err ->
                         throw RenderPipelineException(phase = RenderPhase.FRAME_CAPTURE, technicalDetail = err)
                     }
                     val nowElapsedMs = System.currentTimeMillis() - startWallMs

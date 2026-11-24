@@ -93,6 +93,12 @@ class EglSurfaceRenderer {
         }
     }
 
+    enum class OesFrameStatus {
+        NEW_FRAME_RENDERED,
+        REPEATED_PREVIOUS_FRAME,
+        NO_FRAME_AVAILABLE
+    }
+
     fun discardPendingOesFrames() {
         runSyncOnGl {
             val st = oesSurfaceTexture ?: return@runSyncOnGl
@@ -105,6 +111,14 @@ class EglSurfaceRenderer {
     }
 
     fun drawOesFrame(ptsNs: Long, waitMs: Long = 14L): Boolean {
+        return drawOesFrameChecked(ptsNs, waitMs, allowRepeatPrevious = true) != OesFrameStatus.NO_FRAME_AVAILABLE
+    }
+
+    fun drawOesFrameChecked(
+        ptsNs: Long,
+        waitMs: Long = 28L,
+        allowRepeatPrevious: Boolean = false
+    ): OesFrameStatus {
         if (!hasNewOesFrame.get() && waitMs > 0L) {
             synchronized(frameSync) {
                 if (!hasNewOesFrame.get()) {
@@ -112,23 +126,29 @@ class EglSurfaceRenderer {
                 }
             }
         }
-        var rendered = false
+        var status = OesFrameStatus.NO_FRAME_AVAILABLE
         runSyncOnGl {
             val st = oesSurfaceTexture ?: return@runSyncOnGl
+            var updatedNew = false
             if (hasNewOesFrame.compareAndSet(true, false)) {
                 runCatching {
                     st.updateTexImage()
                     st.getTransformMatrix(stMatrix)
                     oesFramesReceived.incrementAndGet()
+                    updatedNew = true
                 }
             }
-            if (oesFramesReceived.get() > 0) {
+            if (updatedNew) {
                 renderOesQuad(ptsNs)
                 lastDrawnWasOes = true
-                rendered = true
+                status = OesFrameStatus.NEW_FRAME_RENDERED
+            } else if (allowRepeatPrevious && oesFramesReceived.get() > 0) {
+                renderOesQuad(ptsNs)
+                lastDrawnWasOes = true
+                status = OesFrameStatus.REPEATED_PREVIOUS_FRAME
             }
         }
-        return rendered
+        return status
     }
 
     fun drawBitmapFrame(bitmap: Bitmap, ptsNs: Long) {

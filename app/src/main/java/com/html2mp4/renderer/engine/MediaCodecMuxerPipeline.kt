@@ -50,13 +50,29 @@ class MediaCodecMuxerPipeline(
         private set
     var encodedHeight: Int = config.resolvedHeight
         private set
+    var activeVideoEncoderName: String = deviceProfile.activeEncoderLabel
+        private set
+    var activeAudioEncoderName: String = if (!config.isAudioMuted) config.audioCodec.label else "Muted"
+        private set
 
     private val expectAudioTrack = !config.isAudioMuted
+    private val released = java.util.concurrent.atomic.AtomicBoolean(false)
     private val pendingSamples = ArrayList<PendingMuxSample>(256)
     private var totalAudioSamplesWritten = 0L
     private var firstRawVideoPtsUs = -1L
     private var lastVideoPtsUs = -1L
     private var lastAudioPtsUs = -1L
+
+    private var firstAudioSourcePtsMs = -1L
+    private var lastAudioInputPtsUs = -1L
+    var audioGapSilencesInserted: Int = 0
+        private set
+    var audioSilencePaddedMs: Long = 0L
+        private set
+    var maxAbsAvDriftMs: Long = 0L
+        private set
+    var finalAvDriftMs: Long = 0L
+        private set
 
     fun audioWrittenDurationMs(): Long =
         (totalAudioSamplesWritten * 1000L) / config.audioSampleRate.hz
@@ -66,6 +82,7 @@ class MediaCodecMuxerPipeline(
         val height = config.resolvedHeight
 
         videoCodec = configureVideoEncoderWithFallback(width, height)
+        activeVideoEncoderName = runCatching { videoCodec.name }.getOrDefault(deviceProfile.activeEncoderLabel)
         inputSurface = videoCodec.createInputSurface()
         videoCodec.start()
 
@@ -88,8 +105,11 @@ class MediaCodecMuxerPipeline(
 
             audioCodec = MediaCodec.createEncoderByType(resolvedAudioMime).apply {
                 configure(audioFormat, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+                activeAudioEncoderName = runCatching { name }.getOrDefault(resolvedAudioMime)
                 start()
             }
+        } else {
+            activeAudioEncoderName = "Muted"
         }
 
         muxer = MediaMuxer(tempOutputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
@@ -235,7 +255,67 @@ class MediaCodecMuxerPipeline(
         }
     }
 
+    /**
+     * Feeds an incoming AudioPcmChunk preserving original source timestamp (ptsMs),
+     * validating/resampling sampleRate & channels, compensating >45ms lost-chunk gaps with
+     * bounded silence, and guaranteeing monotonic encoder PTS.
+     */
+    fun feedAudioChunk(chunk: AudioPcmChunk) {
+        val normalized = adaptPcmToTarget(
+            srcBytes = chunk.pcmBytes,
+            srcRate = chunk.sampleRate,
+            srcChannels = chunk.channels
+        )
+        if (normalized.isEmpty()) return
+
+        if (firstAudioSourcePtsMs < 0L) {
+            firstAudioSourcePtsMs = chunk.ptsMs
+        }
+        val relSourceMs = (chunk.ptsMs - firstAudioSourcePtsMs).coerceAtLeast(0L)
+        val writtenMs = audioWrittenDurationMs()
+
+        // Compensate genuine gaps > 45ms so subsequent audio stays anchored to original ptsMs
+        val gapMs = AudioPcmMath.computeGapSilenceMs(relSourceMs, writtenMs)
+        if (gapMs > 0L) {
+            val gapFrames = ((gapMs * config.audioSampleRate.hz) / 1000L).toInt()
+            if (gapFrames > 0) {
+                val silenceBytes = ByteArray(gapFrames * 2 * config.audioChannels.count)
+                feedAudioPcmInternal(silenceBytes, explicitPtsUs = null)
+                audioGapSilencesInserted++
+                audioSilencePaddedMs += gapMs
+            }
+        }
+
+        val sampleTimelineUs = (totalAudioSamplesWritten * 1_000_000L) / config.audioSampleRate.hz
+        val sourcePtsUs = maxOf(sampleTimelineUs, relSourceMs * 1_000L)
+        feedAudioPcmInternal(normalized, explicitPtsUs = sourcePtsUs)
+    }
+
+    fun feedSilencePadding(silenceBytes: ByteArray) {
+        if (silenceBytes.isEmpty()) return
+        val bytesPerSampleFrame = 2 * config.audioChannels.count
+        val addedFrames = silenceBytes.size / bytesPerSampleFrame
+        if (addedFrames > 0) {
+            audioSilencePaddedMs += (addedFrames * 1000L) / config.audioSampleRate.hz
+        }
+        feedAudioPcmInternal(silenceBytes, explicitPtsUs = null)
+    }
+
+    fun sampleAvDrift(videoTimelineMs: Long) {
+        val audioMs = if (lastAudioPtsUs >= 0L) (lastAudioPtsUs / 1_000L) else audioWrittenDurationMs()
+        val driftMs = audioMs - videoTimelineMs
+        finalAvDriftMs = driftMs
+        val absDrift = kotlin.math.abs(driftMs)
+        if (absDrift > maxAbsAvDriftMs) {
+            maxAbsAvDriftMs = absDrift
+        }
+    }
+
     fun feedAudioPcm(pcmBytes: ByteArray) {
+        feedAudioPcmInternal(pcmBytes, explicitPtsUs = null)
+    }
+
+    private fun feedAudioPcmInternal(pcmBytes: ByteArray, explicitPtsUs: Long?) {
         val codec = audioCodec ?: return
         val bytesPerSampleFrame = 2 * config.audioChannels.count
         var offset = 0
@@ -256,7 +336,13 @@ class MediaCodecMuxerPipeline(
             buf.put(pcmBytes, offset, toCopy)
 
             val framesInChunk = toCopy / bytesPerSampleFrame
-            val ptsUs = (totalAudioSamplesWritten * 1_000_000L) / config.audioSampleRate.hz
+            val chunkStartSampleUs = (totalAudioSamplesWritten * 1_000_000L) / config.audioSampleRate.hz
+            val offsetDeltaUs = ((offset / bytesPerSampleFrame).toLong() * 1_000_000L) / config.audioSampleRate.hz
+            var ptsUs = explicitPtsUs?.let { it + offsetDeltaUs } ?: chunkStartSampleUs
+            if (ptsUs <= lastAudioInputPtsUs) {
+                ptsUs = lastAudioInputPtsUs + 1L
+            }
+            lastAudioInputPtsUs = ptsUs
             totalAudioSamplesWritten += framesInChunk
 
             codec.queueInputBuffer(inIdx, 0, toCopy, ptsUs, 0)
@@ -264,6 +350,15 @@ class MediaCodecMuxerPipeline(
             drainAudio(endOfStream = false)
         }
     }
+
+    private fun adaptPcmToTarget(srcBytes: ByteArray, srcRate: Int, srcChannels: Int): ByteArray =
+        AudioPcmMath.adaptPcmToTarget(
+            srcBytes = srcBytes,
+            srcRate = srcRate,
+            srcChannels = srcChannels,
+            targetRate = config.audioSampleRate.hz,
+            targetChannels = config.audioChannels.count
+        )
 
     fun finishAudioStream() {
         val codec = audioCodec ?: return
@@ -347,6 +442,7 @@ class MediaCodecMuxerPipeline(
     }
 
     fun release() {
+        if (!released.compareAndSet(false, true)) return
         runCatching { if (::videoCodec.isInitialized) videoCodec.stop() }
         runCatching { if (::videoCodec.isInitialized) videoCodec.release() }
         runCatching { if (::inputSurface.isInitialized) inputSurface.release() }
@@ -356,5 +452,6 @@ class MediaCodecMuxerPipeline(
             if (muxerStarted) muxer?.stop()
             muxer?.release()
         }
+        muxer = null
     }
 }

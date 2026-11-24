@@ -4,6 +4,9 @@ import com.html2mp4.renderer.model.AppLanguage
 import com.html2mp4.renderer.model.AudioChannelOption
 import com.html2mp4.renderer.model.AudioCodecOption
 import com.html2mp4.renderer.model.FrameRateOption
+import com.html2mp4.renderer.model.RenderPhase
+import com.html2mp4.renderer.model.RenderTimelineMode
+import com.html2mp4.renderer.model.RenderTimelineSummary
 import com.html2mp4.renderer.model.ResolutionPreset
 import com.html2mp4.renderer.model.ThemeMode
 import com.html2mp4.renderer.model.VideoBitratePreset
@@ -155,8 +158,32 @@ data class AppStrings(
     val aboutDonateButton: String,
     val aboutQrisTitle: String,
     val aboutQrisSubtitle: String,
+    val timelineModeLabel: String,
+    val timelineDeterministicOption: String,
+    val timelineRealtimeOption: String,
+    val timelineDeterministicHint: String,
+    val timelineRealtimeHint: String,
+    val renderSummaryFramesFormat: (Int, Int, Int, Int) -> String,
+    val renderSummaryAudioFormat: (String, Long, Long, Long, Int, Int, Long, Long) -> String,
+    val renderSummaryFallbackBitmap: String,
+    val renderDiagTitle: String,
+    val renderDiagEncoderFormat: (String, String, Int, Int, String) -> String,
+    val renderDiagMemoryFormat: (Long, Long, Int) -> String,
+    val renderDiagWallDurationFormat: (Long) -> String,
+    val renderDiagValidationOkFormat: (Boolean, Boolean, Boolean, Long, Float, Boolean) -> String,
+    val renderDiagValidationWarnTitle: String,
+    val renderFailedPhaseFormat: (RenderPhase) -> String,
     val isIndonesian: Boolean
 ) {
+    fun timelineModeOptionLabel(mode: RenderTimelineMode): String = when (mode) {
+        RenderTimelineMode.DETERMINISTIC -> timelineDeterministicOption
+        RenderTimelineMode.REALTIME_COMPAT -> timelineRealtimeOption
+    }
+
+    fun timelineModeHint(mode: RenderTimelineMode): String = when (mode) {
+        RenderTimelineMode.DETERMINISTIC -> timelineDeterministicHint
+        RenderTimelineMode.REALTIME_COMPAT -> timelineRealtimeHint
+    }
     fun orientationLabel(o: VideoOrientation): String = when (o) {
         VideoOrientation.LANDSCAPE -> if (isIndonesian) "Lanskap (16:9)" else "Landscape (16:9)"
         VideoOrientation.PORTRAIT -> if (isIndonesian) "Vertikal (9:16)" else "Portrait (9:16)"
@@ -356,6 +383,42 @@ private val IndonesianStrings = AppStrings(
     aboutDonateButton = "Donate",
     aboutQrisTitle = "Dukung Developer (QRIS)",
     aboutQrisSubtitle = "Ketuk tanda X di pojok kanan atas foto untuk menutup jendela.",
+    timelineModeLabel = "Mode Timeline",
+    timelineDeterministicOption = "Deterministik (Presisi Frame)",
+    timelineRealtimeOption = "Real-Time Kompatibilitas (Klasik)",
+    timelineDeterministicHint = "Waktu animasi dikunci tepat t = frameIndex / fps (rAF, WAAPI, CSS). Audio Web Audio API tetap berjalan real-time.",
+    timelineRealtimeHint = "Mode klasik berbasis waktu nyata perangkat. Gunakan jika halaman HTML bergantung pada timing real-time.",
+    renderSummaryFramesFormat = { submitted, expected, repeated, dropped ->
+        "Frame: $submitted/$expected · Ulang: $repeated · Gagal/Lewat: $dropped"
+    },
+    renderSummaryAudioFormat = { engine, rx, dropOverflow, missingSeq, srHz, ch, maxDrift, finalDrift ->
+        "Audio ($engine · ${srHz}Hz ${ch}ch): $rx chunk · Drop: $dropOverflow · Hilang: $missingSeq · Drift max/akhir: ${maxDrift}ms/${finalDrift}ms"
+    },
+    renderSummaryFallbackBitmap = "Jalur fallback Bitmap/Canvas aktif",
+    renderDiagTitle = "Diagnostik & Validasi MP4",
+    renderDiagEncoderFormat = { vEnc, aEnc, w, h, sizeText ->
+        "Video: $vEnc (${w}×${h}) · Audio: $aEnc · Ukuran MP4: $sizeText"
+    },
+    renderDiagMemoryFormat = { peakMb, minAvailMb, throttles ->
+        "Memori Peak: ${peakMb} MB · Sisa Min: ${minAvailMb} MB · Throttle: $throttles×"
+    },
+    renderDiagWallDurationFormat = { wallMs ->
+        val sec = wallMs / 1000.0
+        String.format(Locale.US, "Waktu Render Total: %.2f detik (%d ms)", sec, wallMs)
+    },
+    renderDiagValidationOkFormat = { hasV, hasA, expA, actualDurMs, measuredFps, playable ->
+        val vTag = if (hasV) "Video OK" else "Video HILANG"
+        val aTag = when {
+            !expA -> "Audio Muted"
+            hasA -> "Audio OK"
+            else -> "Audio HILANG"
+        }
+        val playTag = if (playable) "Playable" else "Tidak Valid"
+        val fpsText = String.format(Locale.US, "%.1f", measuredFps)
+        "Validasi Track: $vTag · $aTag · ${actualDurMs}ms @ ${fpsText} FPS · Status: $playTag"
+    },
+    renderDiagValidationWarnTitle = "Peringatan Validasi:",
+    renderFailedPhaseFormat = { phase -> "Fase: ${phase.labelId}" },
     isIndonesian = true
 )
 
@@ -512,6 +575,42 @@ private val EnglishStrings = AppStrings(
     aboutDonateButton = "Donate",
     aboutQrisTitle = "Support Developer (QRIS)",
     aboutQrisSubtitle = "Tap the X mark on the top-right corner of the photo to close.",
+    timelineModeLabel = "Timeline Mode",
+    timelineDeterministicOption = "Deterministic (Frame-Accurate)",
+    timelineRealtimeOption = "Real-Time Compat (Classic)",
+    timelineDeterministicHint = "Locks animation clock to t = frameIndex / fps (rAF, WAAPI, CSS). Web Audio API still runs on real-time hardware clock.",
+    timelineRealtimeHint = "Classic device-clock loop. Use if the HTML relies strictly on real-time playback.",
+    renderSummaryFramesFormat = { submitted, expected, repeated, dropped ->
+        "Frames: $submitted/$expected · Repeated: $repeated · Dropped: $dropped"
+    },
+    renderSummaryAudioFormat = { engine, rx, dropOverflow, missingSeq, srHz, ch, maxDrift, finalDrift ->
+        "Audio ($engine · ${srHz}Hz ${ch}ch): $rx chunks · Drop: $dropOverflow · Missing: $missingSeq · Drift max/end: ${maxDrift}ms/${finalDrift}ms"
+    },
+    renderSummaryFallbackBitmap = "Bitmap/Canvas fallback path active",
+    renderDiagTitle = "Render Diagnostics & MP4 Validation",
+    renderDiagEncoderFormat = { vEnc, aEnc, w, h, sizeText ->
+        "Video: $vEnc (${w}×${h}) · Audio: $aEnc · MP4 Size: $sizeText"
+    },
+    renderDiagMemoryFormat = { peakMb, minAvailMb, throttles ->
+        "Peak Memory: ${peakMb} MB · Min Free: ${minAvailMb} MB · Throttles: $throttles×"
+    },
+    renderDiagWallDurationFormat = { wallMs ->
+        val sec = wallMs / 1000.0
+        String.format(Locale.US, "Total Render Time: %.2f s (%d ms)", sec, wallMs)
+    },
+    renderDiagValidationOkFormat = { hasV, hasA, expA, actualDurMs, measuredFps, playable ->
+        val vTag = if (hasV) "Video OK" else "Video MISSING"
+        val aTag = when {
+            !expA -> "Audio Muted"
+            hasA -> "Audio OK"
+            else -> "Audio MISSING"
+        }
+        val playTag = if (playable) "Playable" else "Invalid"
+        val fpsText = String.format(Locale.US, "%.1f", measuredFps)
+        "Track Check: $vTag · $aTag · ${actualDurMs}ms @ ${fpsText} FPS · Status: $playTag"
+    },
+    renderDiagValidationWarnTitle = "Validation Warnings:",
+    renderFailedPhaseFormat = { phase -> "Phase: ${phase.labelEn}" },
     isIndonesian = false
 )
 

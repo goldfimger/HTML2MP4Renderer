@@ -19,6 +19,7 @@ import com.html2mp4.renderer.model.FrameRateOption
 import com.html2mp4.renderer.model.HtmlProjectMetadata
 import com.html2mp4.renderer.model.RenderConfig
 import com.html2mp4.renderer.model.RenderStatus
+import com.html2mp4.renderer.model.RenderTimelineMode
 import com.html2mp4.renderer.model.RenderedVideoItem
 import com.html2mp4.renderer.model.ResolutionPreset
 import com.html2mp4.renderer.model.ThemeMode
@@ -254,6 +255,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun updateFrameRate(fps: FrameRateOption) {
         _config.update { it.copy(frameRate = fps) }
+    }
+
+    fun updateTimelineMode(mode: RenderTimelineMode) {
+        _config.update { it.copy(timelineMode = mode) }
     }
 
     fun updateVideoCodec(codec: VideoCodecOption) {

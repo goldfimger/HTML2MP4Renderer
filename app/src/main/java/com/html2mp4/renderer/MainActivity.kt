@@ -253,6 +253,7 @@ class MainActivity : ComponentActivity() {
                                         onResolutionChange = vm::updateResolution,
                                         onCustomSizeChange = vm::updateCustomDimensions,
                                         onFrameRateChange = vm::updateFrameRate,
+                                        onTimelineModeChange = vm::updateTimelineMode,
                                         onVideoCodecChange = vm::updateVideoCodec,
                                         onVideoBitratePresetChange = vm::updateVideoBitratePreset,
                                         onCustomBitrateChange = vm::updateCustomBitrate,

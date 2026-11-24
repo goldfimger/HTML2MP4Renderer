@@ -61,6 +61,7 @@ import com.html2mp4.renderer.model.FrameRateOption
 import com.html2mp4.renderer.model.HtmlProjectMetadata
 import com.html2mp4.renderer.model.RenderConfig
 import com.html2mp4.renderer.model.RenderStatus
+import com.html2mp4.renderer.model.RenderTimelineMode
 import com.html2mp4.renderer.model.ResolutionPreset
 import com.html2mp4.renderer.model.VideoBitratePreset
 import com.html2mp4.renderer.model.VideoCodecOption
@@ -86,6 +87,7 @@ fun ProjectScreen(
     onResolutionChange: (ResolutionPreset) -> Unit,
     onCustomSizeChange: (Int, Int) -> Unit,
     onFrameRateChange: (FrameRateOption) -> Unit,
+    onTimelineModeChange: (RenderTimelineMode) -> Unit,
     onVideoCodecChange: (VideoCodecOption) -> Unit,
     onVideoBitratePresetChange: (VideoBitratePreset) -> Unit,
     onCustomBitrateChange: (Int) -> Unit,
@@ -254,38 +256,171 @@ fun ProjectScreen(
             }
             is RenderStatus.Completed -> {
                 ElevatedCard(modifier = Modifier.fillMaxWidth()) {
-                    Row(
-                        modifier = Modifier.padding(16.dp).fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        Icon(Icons.Rounded.CheckCircle, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(strings.renderCompleted, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
-                            Text(renderStatus.fileName, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Column(modifier = Modifier.padding(16.dp).fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            Icon(Icons.Rounded.CheckCircle, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(strings.renderCompleted, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+                                Text(renderStatus.fileName, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                            }
+                            TextButton(onClick = {
+                                onDismissStatus()
+                                onNavigateToResults()
+                            }) {
+                                Text(strings.viewResults)
+                            }
                         }
-                        TextButton(onClick = {
-                            onDismissStatus()
-                            onNavigateToResults()
-                        }) {
-                            Text(strings.viewResults)
+                        renderStatus.timelineSummary?.let { summary ->
+                            HorizontalDivider()
+                            val diag = summary.diagnostics
+                            Text(
+                                text = strings.renderDiagTitle,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.primary
+                            )
+                            Text(
+                                text = "${strings.timelineModeOptionLabel(summary.timelineMode)} · ${summary.targetFps} FPS · ${strings.renderDiagWallDurationFormat(summary.renderWallDurationMs)}",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                            Text(
+                                text = strings.renderSummaryFramesFormat(
+                                    summary.submittedFrames,
+                                    summary.expectedFrames,
+                                    summary.repeatedFrames,
+                                    summary.droppedOrFailedFrames
+                                ),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            if (diag != null) {
+                                Text(
+                                    text = strings.renderDiagEncoderFormat(
+                                        diag.videoEncoderName,
+                                        diag.audioEncoderName,
+                                        diag.videoWidth,
+                                        diag.videoHeight,
+                                        formatBytes(diag.mp4FileSizeBytes)
+                                    ),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                Text(
+                                    text = strings.renderDiagMemoryFormat(
+                                        diag.memory.peakUsedRamMb,
+                                        diag.memory.minAvailableRamMb,
+                                        diag.memory.lowMemoryThrottleCount
+                                    ),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                                diag.validation?.let { valRep ->
+                                    Text(
+                                        text = strings.renderDiagValidationOkFormat(
+                                            valRep.hasVideoTrack,
+                                            valRep.hasAudioTrack,
+                                            valRep.audioExpected,
+                                            valRep.actualDurationMs,
+                                            valRep.measuredFps,
+                                            valRep.isPlayable
+                                        ),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (valRep.isPlayable && valRep.warnings.isEmpty()) {
+                                            MaterialTheme.colorScheme.primary
+                                        } else {
+                                            MaterialTheme.colorScheme.tertiary
+                                        },
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                    if (valRep.warnings.isNotEmpty()) {
+                                        Text(
+                                            text = "${strings.renderDiagValidationWarnTitle} ${valRep.warnings.joinToString("; ")}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = MaterialTheme.colorScheme.error
+                                        )
+                                    }
+                                }
+                            }
+                            if (summary.usedBitmapFallback) {
+                                Text(
+                                    text = strings.renderSummaryFallbackBitmap,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.tertiary
+                                )
+                            }
+                            summary.audioSummary?.let { audio ->
+                                Text(
+                                    text = strings.renderSummaryAudioFormat(
+                                        audio.tapEngine,
+                                        audio.receivedChunks,
+                                        audio.droppedOverflowChunks,
+                                        audio.missingSequenceChunks,
+                                        audio.targetSampleRateHz,
+                                        audio.targetChannels,
+                                        audio.maxAvDriftMs,
+                                        audio.finalAvDriftMs
+                                    ),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                            summary.capabilities.notes.forEach { note ->
+                                Text(
+                                    text = "• $note",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
                         }
                     }
                 }
             }
             is RenderStatus.Failed -> {
-                ElevatedCard(modifier = Modifier.fillMaxWidth()) {
-                    Row(
+                ElevatedCard(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.elevatedCardColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.35f)
+                    )
+                ) {
+                    Column(
                         modifier = Modifier.padding(16.dp).fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        Text(
-                            text = "${strings.failedPrefix}: ${renderStatus.errorMessage}",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.error,
-                            modifier = Modifier.weight(1f)
-                        )
-                        TextButton(onClick = onDismissStatus) { Text(strings.closeButton) }
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                Text(
+                                    text = "${strings.failedPrefix}: ${renderStatus.errorMessage}",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = MaterialTheme.colorScheme.error
+                                )
+                                renderStatus.failedPhase?.let { phase ->
+                                    Text(
+                                        text = strings.renderFailedPhaseFormat(phase),
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer,
+                                        fontWeight = FontWeight.Medium
+                                    )
+                                }
+                            }
+                            TextButton(onClick = onDismissStatus) { Text(strings.closeButton) }
+                        }
+                        if (!renderStatus.technicalDetail.isNullOrBlank()) {
+                            Text(
+                                text = renderStatus.technicalDetail,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer
+                            )
+                        }
                     }
                 }
             }
@@ -398,6 +533,20 @@ fun ProjectScreen(
                     optionLabel = { strings.fpsLabel(it) },
                     enabled = !isRendering,
                     onSelect = onFrameRateChange
+                )
+
+                M3Dropdown(
+                    label = strings.timelineModeLabel,
+                    selectedText = strings.timelineModeOptionLabel(config.timelineMode),
+                    options = RenderTimelineMode.entries,
+                    optionLabel = { strings.timelineModeOptionLabel(it) },
+                    enabled = !isRendering,
+                    onSelect = onTimelineModeChange
+                )
+                Text(
+                    text = strings.timelineModeHint(config.timelineMode),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
 
                 M3Dropdown(

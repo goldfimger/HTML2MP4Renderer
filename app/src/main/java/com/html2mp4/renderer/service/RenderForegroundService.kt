@@ -19,6 +19,8 @@ import com.html2mp4.renderer.R
 import com.html2mp4.renderer.data.RenderRepository
 import com.html2mp4.renderer.engine.WebViewOffscreenRenderer
 import com.html2mp4.renderer.model.RenderConfig
+import com.html2mp4.renderer.model.RenderPhase
+import com.html2mp4.renderer.model.RenderPipelineException
 import com.html2mp4.renderer.model.RenderStatus
 import com.html2mp4.renderer.util.ChipsetOptimizer
 import com.html2mp4.renderer.util.MemoryGuard
@@ -117,7 +119,7 @@ class RenderForegroundService : Service() {
                 _status.value = RenderStatus.Preparing("Memuat dokumen HTML secara aman...")
 
                 val renderer = WebViewOffscreenRenderer(applicationContext, memoryGuard)
-                renderer.renderToMp4(
+                val summary = renderer.renderToMp4(
                     htmlUri = request.htmlUri,
                     assetsTreeUri = request.assetsTreeUri,
                     config = request.config,
@@ -140,23 +142,40 @@ class RenderForegroundService : Service() {
                 }
 
                 val outName = buildOutputFileName(request.sourceFileName)
-                val savedUri = repository.saveTempMp4ToOutput(
-                    tempFile = tempFile,
-                    fileName = outName,
-                    outputTreeUri = request.config.outputTreeUri
-                )
+                val savedUri = try {
+                    repository.saveTempMp4ToOutput(
+                        tempFile = tempFile,
+                        fileName = outName,
+                        outputTreeUri = request.config.outputTreeUri
+                    )
+                } catch (saveErr: Throwable) {
+                    throw RenderPipelineException(
+                        phase = RenderPhase.OUTPUT_SAVE,
+                        technicalDetail = "Gagal menyimpan MP4 ke folder tujuan: ${saveErr.localizedMessage ?: saveErr::class.java.simpleName}",
+                        cause = saveErr
+                    )
+                }
 
                 _status.value = RenderStatus.Completed(
                     outputUri = savedUri,
                     fileName = outName,
-                    durationMs = request.durationMs
+                    durationMs = request.durationMs,
+                    timelineSummary = summary
                 )
                 postCompletionNotification(outName)
             } catch (_: CancellationException) {
                 _status.value = RenderStatus.Cancelled("Proses rendering dibatalkan.")
+            } catch (rpe: RenderPipelineException) {
+                _status.value = RenderStatus.Failed(
+                    errorMessage = "Gagal di fase ${rpe.phase.labelId}",
+                    failedPhase = rpe.phase,
+                    technicalDetail = rpe.technicalDetail ?: rpe.cause?.localizedMessage
+                )
             } catch (t: Throwable) {
                 _status.value = RenderStatus.Failed(
-                    t.localizedMessage ?: "Gagal melakukan rendering video MP4."
+                    errorMessage = t.localizedMessage ?: "Kesalahan pipeline rendering (${t::class.java.simpleName})",
+                    failedPhase = RenderPhase.INITIALIZING,
+                    technicalDetail = t.stackTraceToString().lineSequence().take(4).joinToString(" | ")
                 )
             } finally {
                 tempFile.delete()

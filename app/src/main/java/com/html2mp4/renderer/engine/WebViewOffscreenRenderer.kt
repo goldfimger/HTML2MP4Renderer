@@ -17,6 +17,8 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
+import android.webkit.RenderProcessGoneDetail
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
@@ -26,8 +28,14 @@ import android.widget.FrameLayout
 import androidx.webkit.WebViewCompat
 import androidx.webkit.WebViewFeature
 import com.html2mp4.renderer.model.RenderConfig
+import com.html2mp4.renderer.model.RenderDiagnosticsReport
+import com.html2mp4.renderer.model.RenderPhase
+import com.html2mp4.renderer.model.RenderPipelineException
+import com.html2mp4.renderer.model.RenderTimelineMode
+import com.html2mp4.renderer.model.RenderTimelineSummary
 import com.html2mp4.renderer.util.ChipsetOptimizer
 import com.html2mp4.renderer.util.MemoryGuard
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -121,9 +129,11 @@ class WebViewOffscreenRenderer(
         durationMs: Long,
         tempOutputFile: File,
         onProgress: (RenderProgress) -> Unit
-    ) {
+    ): RenderTimelineSummary {
         val fps = config.frameRate.fps
-        val totalFrames = ceil((durationMs / 1000.0) * fps).toInt().coerceAtLeast(fps)
+        val isDeterministic = config.timelineMode == RenderTimelineMode.DETERMINISTIC
+        val timelineEngine = DeterministicTimelineEngine(fps = fps, durationMs = durationMs)
+        val totalFrames = timelineEngine.totalFrames
 
         val deviceProfile = ChipsetOptimizer.detect(context)
         val bridge = HtmlBridge(config.audioSampleRate.hz, config.audioChannels.count).apply {
@@ -133,6 +143,9 @@ class WebViewOffscreenRenderer(
         val pipeline = MediaCodecMuxerPipeline(config, deviceProfile, tempOutputFile)
         val eglRenderer = EglSurfaceRenderer()
         val pageLoaded = CompletableDeferred<Unit>()
+        @Volatile var fatalWebViewError: String? = null
+        var currentPhase = RenderPhase.INITIALIZING
+        memoryGuard.resetSessionStats()
 
         var webView: WebView? = null
         var virtualDisplay: VirtualDisplay? = null
@@ -141,13 +154,31 @@ class WebViewOffscreenRenderer(
         var frameBitmap: Bitmap? = null
         var bitmapCanvas: Canvas? = null
         var usingPresentation = false
+        var usedBitmapFallback = false
 
         try {
+            currentPhase = RenderPhase.MEDIA_CODEC_PREPARE
             pipeline.prepare()
             val width = pipeline.encodedWidth
             val height = pipeline.encodedHeight
+
+            currentPhase = RenderPhase.EGL_SURFACE_PREPARE
             eglRenderer.prepare(pipeline.inputSurface, width, height)
             val oesSurface = eglRenderer.oesInputSurface
+
+            currentPhase = RenderPhase.WEBVIEW_LOAD
+
+            val audioBootstrap = HtmlBridge.buildBootstrapScript(
+                sampleRate = config.audioSampleRate.hz,
+                channels = config.audioChannels.count,
+                captureAudio = !config.isAudioMuted
+            )
+            val docStartScript = if (isDeterministic) {
+                DeterministicTimelineEngine.buildVirtualClockBootstrap(fps) + "
+;" + audioBootstrap
+            } else {
+                audioBootstrap
+            }
 
             withContext(Dispatchers.Main) {
                 runCatching { WebView.enableSlowWholeDocumentDraw() }
@@ -171,12 +202,6 @@ class WebViewOffscreenRenderer(
                     null
                 }
 
-                val docStartBootstrap = HtmlBridge.buildBootstrapScript(
-                    sampleRate = config.audioSampleRate.hz,
-                    channels = config.audioChannels.count,
-                    captureAudio = !config.isAudioMuted
-                )
-
                 if (vdAttempt != null) {
                     val presAttempt = runCatching {
                         val disp = vdAttempt.display
@@ -199,7 +224,11 @@ class WebViewOffscreenRenderer(
                             hardwareLayer = true,
                             muteAudioAtBrowser = config.isAudioMuted,
                             requireUserGesture = false,
-                            documentStartScript = docStartBootstrap
+                            documentStartScript = docStartScript,
+                            onFatalError = { err ->
+                                fatalWebViewError = err
+                                if (!pageLoaded.isCompleted) pageLoaded.complete(Unit)
+                            }
                         ) {
                             if (!pageLoaded.isCompleted) pageLoaded.complete(Unit)
                         }.apply {
@@ -245,6 +274,7 @@ class WebViewOffscreenRenderer(
                 }
 
                 if (!usingPresentation) {
+                    usedBitmapFallback = true
                     webView = createConfiguredWebView(
                         hostContext = context,
                         bridge = bridge,
@@ -252,7 +282,11 @@ class WebViewOffscreenRenderer(
                         hardwareLayer = false,
                         muteAudioAtBrowser = config.isAudioMuted,
                         requireUserGesture = false,
-                        documentStartScript = docStartBootstrap
+                        documentStartScript = docStartScript,
+                        onFatalError = { err ->
+                            fatalWebViewError = err
+                            if (!pageLoaded.isCompleted) pageLoaded.complete(Unit)
+                        }
                     ) {
                         if (!pageLoaded.isCompleted) pageLoaded.complete(Unit)
                     }.apply {
@@ -271,19 +305,23 @@ class WebViewOffscreenRenderer(
             }
 
             withTimeoutOrNull(12_000L) { pageLoaded.await() }
+                ?: throw RenderPipelineException(
+                    phase = RenderPhase.WEBVIEW_LOAD,
+                    technicalDetail = "Timeout memuat dokumen HTML di WebView (>12 detik)."
+                )
+            fatalWebViewError?.let { err ->
+                throw RenderPipelineException(phase = RenderPhase.WEBVIEW_LOAD, technicalDetail = err)
+            }
             delay(150L)
+
+            currentPhase = RenderPhase.FRAME_CAPTURE
 
             // Flush any initial loading-stage texture before real playback begins
             eglRenderer.discardPendingOesFrames()
 
             withContext(Dispatchers.Main) {
-                val bootstrap = HtmlBridge.buildBootstrapScript(
-                    sampleRate = config.audioSampleRate.hz,
-                    channels = config.audioChannels.count,
-                    captureAudio = !config.isAudioMuted
-                )
                 webView?.evaluateJavascript(
-                    "$bootstrap; if (window.__html2mp4PrepareAndStart) { window.__html2mp4PrepareAndStart(); } else { window.__html2mp4StartPlayback(); if (window.AndroidHtml2Mp4) window.AndroidHtml2Mp4.onPlaybackStarted(); }",
+                    "$docStartScript; if (window.__html2mp4PrepareAndStart) { window.__html2mp4PrepareAndStart(); } else { window.__html2mp4StartPlayback(); if (window.AndroidHtml2Mp4) window.AndroidHtml2Mp4.onPlaybackStarted(); }",
                     null
                 )
             }
@@ -291,113 +329,264 @@ class WebViewOffscreenRenderer(
             // Wait until fonts, images, media reset, and Frame 0 playback are armed
             withTimeoutOrNull(4_000L) { bridge.playbackStartedDeferred.await() }
             if (!bridge.isCapturingAudio && !config.isAudioMuted) {
-                bridge.audioChunkQueue.clear()
+                bridge.resetAudioQueue()
                 bridge.isCapturingAudio = true
             }
 
-            val frameDurationNs = (1_000_000_000L / fps).coerceAtLeast(16_000_000L)
-            val frameDurationMs = (1000L / fps).coerceAtLeast(16L)
             val silenceFrameBytes = ByteArray((config.audioSampleRate.hz / fps) * 2 * config.audioChannels.count)
-
             var hasReceivedRealAudio = false
-            var frameIdx = 0
             val startWallMs = System.currentTimeMillis()
+            var lastReportedFrame = 0
 
-            while (coroutineContext.isActive) {
-                val nowElapsedMs = System.currentTimeMillis() - startWallMs
-                if (nowElapsedMs >= durationMs && frameIdx > 0) break
-
-                if (memoryGuard.shouldThrottleFrameQueue()) {
-                    delay(8L)
+            if (isDeterministic) {
+                // =========================================================================
+                // MODE: DETERMINISTIC (virtual clock t = frameIndex / fps, zero silent drops)
+                // =========================================================================
+                withContext(Dispatchers.Main) {
+                    webView?.evaluateJavascript("if (window.__html2mp4EnableVirtualClock) window.__html2mp4EnableVirtualClock();", null)
                 }
 
-                if (usingPresentation) {
-                    withContext(Dispatchers.Main) {
-                        val wv = webView ?: return@withContext
-                        pulseView?.let { pv ->
-                            pv.alpha = if (frameIdx % 2 == 0) 0.01f else 0.02f
-                            pv.invalidate()
-                        }
-                        wv.invalidate()
+                while (coroutineContext.isActive && timelineEngine.hasNextFrame()) {
+                    fatalWebViewError?.let { err ->
+                        throw RenderPipelineException(phase = RenderPhase.FRAME_CAPTURE, technicalDetail = err)
+                    }
+                    val tick = timelineEngine.advance() ?: break
+                    lastReportedFrame = tick.frameIndex + 1
+
+                    if (tick.frameIndex % 8 == 0) {
+                        memoryGuard.sampleSessionMemory()
+                    }
+                    if (memoryGuard.shouldThrottleFrameQueue()) {
+                        delay(8L)
                     }
 
-                    val waitMs = if (frameIdx == 0) 280L else 12L
-                    val ok = eglRenderer.drawOesFrame(frameIdx * frameDurationNs, waitMs = waitMs)
-                    if (!ok && !eglRenderer.hasOesFrames()) {
-                        // Device/ROM blocked VirtualDisplay composition; switch cleanly to Bitmap -> EGL_TEXTURE_2D
-                        usingPresentation = false
+                    // 1. Apply exact virtual timestamp on WebView & await JS+CSS+WAAPI readiness off UI thread
+                    val preparedDeferred = bridge.armFramePrepared(tick.frameIndex)
+                    withContext(Dispatchers.Main) {
+                        val wv = webView ?: return@withContext
+                        wv.evaluateJavascript(
+                            "if (window.__html2mp4StepTo) { window.__html2mp4StepTo(${tick.htmlAnimationTimeMs}, ${tick.frameIndex}); } else if (window.AndroidHtml2Mp4) { window.AndroidHtml2Mp4.onFramePrepared(${tick.frameIndex}, '{}'); }",
+                            null
+                        )
+                    }
+                    bridge.awaitFramePrepared(
+                        frameSeq = tick.frameIndex,
+                        deferred = preparedDeferred,
+                        timeoutMs = if (tick.frameIndex == 0) 600L else 220L
+                    )
+
+                    // 2. Capture frame using exact monotonic encoderPresentationTimeNs
+                    var frameSubmitted = false
+                    if (usingPresentation) {
                         withContext(Dispatchers.Main) {
-                            webView?.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+                            val wv = webView ?: return@withContext
+                            pulseView?.let { pv ->
+                                pv.alpha = if (tick.frameIndex % 2 == 0) 0.01f else 0.02f
+                                pv.invalidate()
+                            }
+                            wv.invalidate()
                         }
-                    } else if (ok) {
+
+                        val waitMs = if (tick.frameIndex == 0) 280L else 48L
+                        when (eglRenderer.drawOesFrameChecked(tick.encoderPresentationTimeNs, waitMs = waitMs, allowRepeatPrevious = false)) {
+                            EglSurfaceRenderer.OesFrameStatus.NEW_FRAME_RENDERED -> {
+                                timelineEngine.recordSubmittedFrame()
+                                frameSubmitted = true
+                            }
+                            EglSurfaceRenderer.OesFrameStatus.REPEATED_PREVIOUS_FRAME -> {
+                                timelineEngine.recordRepeatedFrame()
+                                frameSubmitted = true
+                            }
+                            EglSurfaceRenderer.OesFrameStatus.NO_FRAME_AVAILABLE -> {
+                                if (!eglRenderer.hasOesFrames()) {
+                                    // GPU VirtualDisplay composition unavailable; switch cleanly to Bitmap fallback for THIS frame & onward
+                                    usingPresentation = false
+                                    usedBitmapFallback = true
+                                    withContext(Dispatchers.Main) {
+                                        webView?.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+                                    }
+                                } else {
+                                    // Static scene produced identical pixels without compositor swap; repeat explicitly & track count
+                                    if (eglRenderer.repeatLastFrame(tick.encoderPresentationTimeNs)) {
+                                        timelineEngine.recordRepeatedFrame()
+                                        frameSubmitted = true
+                                    } else {
+                                        timelineEngine.recordDroppedOrFailedFrame()
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (!usingPresentation && !frameSubmitted) {
+                        val bmp = frameBitmap ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also {
+                            frameBitmap = it
+                            bitmapCanvas = Canvas(it)
+                        }
+                        withContext(Dispatchers.Main) {
+                            val wv = webView ?: return@withContext
+                            val cvs = bitmapCanvas ?: return@withContext
+                            cvs.drawColor(Color.WHITE)
+                            wv.draw(cvs)
+                        }
+                        eglRenderer.drawBitmapFrame(bmp, tick.encoderPresentationTimeNs)
+                        timelineEngine.recordSubmittedFrame()
+                    }
+
+                    pipeline.drainVideo(endOfStream = false)
+
+                    if (!config.isAudioMuted) {
+                        while (true) {
+                            val chunk = bridge.audioChunkQueue.poll() ?: break
+                            hasReceivedRealAudio = true
+                            pipeline.feedAudioChunk(chunk)
+                        }
+                        val targetAudioMs = ((tick.frameIndex + 1).toLong() * 1000L) / fps.toLong()
+                        if (!hasReceivedRealAudio && targetAudioMs > 400L) {
+                            var padGuard = 0
+                            while (pipeline.audioWrittenDurationMs() + 200L < targetAudioMs && padGuard < 4) {
+                                pipeline.feedSilencePadding(silenceFrameBytes)
+                                padGuard++
+                            }
+                        } else if (hasReceivedRealAudio) {
+                            pipeline.sampleAvDrift(targetAudioMs)
+                        }
+                    }
+
+                    if (tick.frameIndex == 0 || (tick.frameIndex + 1) % 4 == 0 || tick.frameIndex + 1 >= totalFrames) {
+                        val elapsed = (System.currentTimeMillis() - startWallMs).coerceAtLeast(1L)
+                        val pct = (((tick.frameIndex + 1).toFloat() / totalFrames.toFloat()) * 98f).roundToInt().coerceIn(0, 98)
+                        val msPerFrame = elapsed.toDouble() / (tick.frameIndex + 1).toDouble()
+                        val remainingMs = ((totalFrames - (tick.frameIndex + 1)) * msPerFrame).toLong().coerceAtLeast(0L)
+                        onProgress(
+                            RenderProgress(
+                                percent = pct,
+                                currentFrame = tick.frameIndex + 1,
+                                totalFrames = totalFrames,
+                                etaFormatted = formatEta(remainingMs),
+                                elapsedMs = elapsed,
+                                phaseLabel = "Deterministik Frame ${tick.frameIndex + 1}/$totalFrames"
+                            )
+                        )
+                    }
+                }
+            } else {
+                // =========================================================================
+                // MODE: REALTIME_COMPAT (legacy wall-clock loop preserved as safe fallback)
+                // =========================================================================
+                val frameDurationMs = (1000L / fps).coerceAtLeast(16L)
+                var frameIdx = 0
+
+                while (coroutineContext.isActive) {
+                    fatalWebViewError?.let { err ->
+                        throw RenderPipelineException(phase = RenderPhase.FRAME_CAPTURE, technicalDetail = err)
+                    }
+                    val nowElapsedMs = System.currentTimeMillis() - startWallMs
+                    if (nowElapsedMs >= durationMs && frameIdx > 0) break
+
+                    if (frameIdx % 8 == 0) {
+                        memoryGuard.sampleSessionMemory()
+                    }
+                    if (memoryGuard.shouldThrottleFrameQueue()) {
+                        delay(8L)
+                    }
+
+                    if (usingPresentation) {
+                        withContext(Dispatchers.Main) {
+                            val wv = webView ?: return@withContext
+                            pulseView?.let { pv ->
+                                pv.alpha = if (frameIdx % 2 == 0) 0.01f else 0.02f
+                                pv.invalidate()
+                            }
+                            wv.invalidate()
+                        }
+
+                        val waitMs = if (frameIdx == 0) 280L else 12L
+                        val ptsNs = timelineEngine.allocateMonotonicPtsNs(frameIdx)
+                        val status = eglRenderer.drawOesFrameChecked(ptsNs, waitMs = waitMs, allowRepeatPrevious = true)
+                        if (status == EglSurfaceRenderer.OesFrameStatus.NO_FRAME_AVAILABLE && !eglRenderer.hasOesFrames()) {
+                            usingPresentation = false
+                            usedBitmapFallback = true
+                            withContext(Dispatchers.Main) {
+                                webView?.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+                            }
+                        } else if (status == EglSurfaceRenderer.OesFrameStatus.NEW_FRAME_RENDERED) {
+                            timelineEngine.recordSubmittedFrame()
+                            frameIdx++
+                        } else if (status == EglSurfaceRenderer.OesFrameStatus.REPEATED_PREVIOUS_FRAME) {
+                            timelineEngine.recordRepeatedFrame()
+                            frameIdx++
+                        }
+                    }
+
+                    if (!usingPresentation) {
+                        val bmp = frameBitmap ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also {
+                            frameBitmap = it
+                            bitmapCanvas = Canvas(it)
+                        }
+                        withContext(Dispatchers.Main) {
+                            val wv = webView ?: return@withContext
+                            val cvs = bitmapCanvas ?: return@withContext
+                            cvs.drawColor(Color.WHITE)
+                            wv.draw(cvs)
+                        }
+                        eglRenderer.drawBitmapFrame(bmp, timelineEngine.allocateMonotonicPtsNs(frameIdx))
+                        timelineEngine.recordSubmittedFrame()
                         frameIdx++
                     }
-                }
 
-                if (!usingPresentation) {
-                    val bmp = frameBitmap ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also {
-                        frameBitmap = it
-                        bitmapCanvas = Canvas(it)
+                    val afterDrawMs = System.currentTimeMillis() - startWallMs
+                    val expectedFrameIdx = ((afterDrawMs * fps) / 1000L).toInt().coerceAtMost(totalFrames)
+                    var catchup = 0
+                    while (frameIdx < expectedFrameIdx && catchup < 3) {
+                        if (!eglRenderer.repeatLastFrame(timelineEngine.allocateMonotonicPtsNs(frameIdx))) break
+                        timelineEngine.recordRepeatedFrame()
+                        frameIdx++
+                        catchup++
                     }
-                    withContext(Dispatchers.Main) {
-                        val wv = webView ?: return@withContext
-                        val cvs = bitmapCanvas ?: return@withContext
-                        cvs.drawColor(Color.WHITE)
-                        wv.draw(cvs)
-                    }
-                    eglRenderer.drawBitmapFrame(bmp, frameIdx * frameDurationNs)
-                    frameIdx++
-                }
 
-                // Lockstep CFR catch-up: keep Video timeline matched 1:1 with real-time Audio clock
-                val afterDrawMs = System.currentTimeMillis() - startWallMs
-                val expectedFrameIdx = ((afterDrawMs * fps) / 1000L).toInt().coerceAtMost(totalFrames)
-                var catchup = 0
-                while (frameIdx < expectedFrameIdx && catchup < 3) {
-                    if (!eglRenderer.repeatLastFrame(frameIdx * frameDurationNs)) break
-                    frameIdx++
-                    catchup++
-                }
+                    pipeline.drainVideo(endOfStream = false)
 
-                pipeline.drainVideo(endOfStream = false)
-
-                val afterFrameElapsedMs = System.currentTimeMillis() - startWallMs
-                if (!config.isAudioMuted) {
-                    while (true) {
-                        val chunk = bridge.audioChunkQueue.poll() ?: break
-                        hasReceivedRealAudio = true
-                        pipeline.feedAudioPcm(chunk.pcmBytes)
-                    }
-                    // Keep audio track valid on completely silent HTML documents without chopping live audio
-                    if (!hasReceivedRealAudio && afterFrameElapsedMs > 600L) {
-                        var padGuard = 0
-                        while (pipeline.audioWrittenDurationMs() + 250L < afterFrameElapsedMs && padGuard < 4) {
-                            pipeline.feedAudioPcm(silenceFrameBytes)
-                            padGuard++
+                    val afterFrameElapsedMs = System.currentTimeMillis() - startWallMs
+                    if (!config.isAudioMuted) {
+                        while (true) {
+                            val chunk = bridge.audioChunkQueue.poll() ?: break
+                            hasReceivedRealAudio = true
+                            pipeline.feedAudioChunk(chunk)
+                        }
+                        if (!hasReceivedRealAudio && afterFrameElapsedMs > 600L) {
+                            var padGuard = 0
+                            while (pipeline.audioWrittenDurationMs() + 250L < afterFrameElapsedMs && padGuard < 4) {
+                                pipeline.feedSilencePadding(silenceFrameBytes)
+                                padGuard++
+                            }
+                        } else if (hasReceivedRealAudio) {
+                            pipeline.sampleAvDrift(afterFrameElapsedMs)
                         }
                     }
-                }
 
-                val targetNextMs = frameIdx * frameDurationMs
-                val sleepCheckElapsedMs = System.currentTimeMillis() - startWallMs
-                if (targetNextMs > sleepCheckElapsedMs && sleepCheckElapsedMs < durationMs) {
-                    delay((targetNextMs - sleepCheckElapsedMs).coerceAtMost(durationMs - sleepCheckElapsedMs))
-                }
+                    val targetNextMs = frameIdx * frameDurationMs
+                    val sleepCheckElapsedMs = System.currentTimeMillis() - startWallMs
+                    if (targetNextMs > sleepCheckElapsedMs && sleepCheckElapsedMs < durationMs) {
+                        delay((targetNextMs - sleepCheckElapsedMs).coerceAtMost(durationMs - sleepCheckElapsedMs))
+                    }
 
-                if (frameIdx == 1 || frameIdx % 4 == 0 || afterFrameElapsedMs >= durationMs) {
-                    val elapsed = afterFrameElapsedMs.coerceAtLeast(1L)
-                    val pct = ((elapsed.toFloat() / durationMs.toFloat()) * 100f).roundToInt().coerceIn(0, 99)
-                    val remainingMs = (durationMs - elapsed).coerceAtLeast(0L)
-                    onProgress(
-                        RenderProgress(
-                            percent = pct,
-                            currentFrame = frameIdx,
-                            totalFrames = totalFrames,
-                            etaFormatted = formatEta(remainingMs),
-                            elapsedMs = elapsed,
-                            phaseLabel = "Encoding Frame $frameIdx (~$totalFrames)"
+                    lastReportedFrame = frameIdx
+                    if (frameIdx == 1 || frameIdx % 4 == 0 || afterFrameElapsedMs >= durationMs) {
+                        val elapsed = afterFrameElapsedMs.coerceAtLeast(1L)
+                        val pct = ((elapsed.toFloat() / durationMs.toFloat()) * 100f).roundToInt().coerceIn(0, 99)
+                        val remainingMs = (durationMs - elapsed).coerceAtLeast(0L)
+                        onProgress(
+                            RenderProgress(
+                                percent = pct,
+                                currentFrame = frameIdx,
+                                totalFrames = totalFrames,
+                                etaFormatted = formatEta(remainingMs),
+                                elapsedMs = elapsed,
+                                phaseLabel = "Real-Time Frame $frameIdx (~$totalFrames)"
+                            )
                         )
-                    )
+                    }
                 }
             }
 
@@ -405,24 +594,30 @@ class WebViewOffscreenRenderer(
                 delay(90L)
                 while (true) {
                     val chunk = bridge.audioChunkQueue.poll() ?: break
-                    pipeline.feedAudioPcm(chunk.pcmBytes)
+                    hasReceivedRealAudio = true
+                    pipeline.feedAudioChunk(chunk)
                 }
                 var endPadGuard = 0
                 while (pipeline.audioWrittenDurationMs() + 40L < durationMs && endPadGuard < 32) {
-                    pipeline.feedAudioPcm(silenceFrameBytes)
+                    pipeline.feedSilencePadding(silenceFrameBytes)
                     endPadGuard++
+                }
+                if (hasReceivedRealAudio) {
+                    pipeline.sampleAvDrift(durationMs)
                 }
             }
 
+            currentPhase = RenderPhase.MP4_FINALIZE
             bridge.isCapturingAudio = false
+            val wallElapsed = (System.currentTimeMillis() - startWallMs).coerceAtLeast(1L)
             onProgress(
                 RenderProgress(
                     percent = 99,
-                    currentFrame = frameIdx,
+                    currentFrame = lastReportedFrame,
                     totalFrames = totalFrames,
                     etaFormatted = "00:01",
-                    elapsedMs = System.currentTimeMillis() - startWallMs,
-                    phaseLabel = "Finalisasi MP4 Muxer..."
+                    elapsedMs = wallElapsed,
+                    phaseLabel = "Finalisasi & Validasi MP4..."
                 )
             )
 
@@ -430,6 +625,69 @@ class WebViewOffscreenRenderer(
                 pipeline.finishAudioStream()
             }
             pipeline.drainVideo(endOfStream = true)
+            val widthOut = pipeline.encodedWidth
+            val heightOut = pipeline.encodedHeight
+            val videoEncName = pipeline.activeVideoEncoderName
+            val audioEncName = pipeline.activeAudioEncoderName
+            val audioSummary = bridge.buildAudioSyncSummary(pipeline, isMuted = config.isAudioMuted)
+
+            // Finalize MediaMuxer BEFORE reading track metadata so moov atom is written cleanly
+            pipeline.release()
+
+            currentPhase = RenderPhase.MP4_VALIDATION
+            val validationReport = withContext(Dispatchers.IO) {
+                Mp4PostMuxValidator.validate(
+                    mp4File = tempOutputFile,
+                    expectedDurationMs = durationMs,
+                    expectAudioTrack = !config.isAudioMuted
+                )
+            }
+
+            if (!validationReport.hasVideoTrack || !validationReport.isPlayable) {
+                throw RenderPipelineException(
+                    phase = RenderPhase.MP4_VALIDATION,
+                    technicalDetail = "Hasil MP4 gagal validasi track/playability: ${validationReport.warnings.joinToString("; ")}"
+                )
+            }
+
+            val memorySnapshot = memoryGuard.snapshotSessionDiagnostics()
+            val diagnostics = RenderDiagnosticsReport(
+                timelineMode = config.timelineMode,
+                targetFps = fps,
+                expectedFrames = totalFrames,
+                submittedFrames = timelineEngine.submittedFrames,
+                repeatedFrames = timelineEngine.repeatedFrames,
+                droppedOrFailedFrames = timelineEngine.droppedOrFailedFrames,
+                renderWallDurationMs = wallElapsed,
+                videoWidth = if (validationReport.videoWidth > 0) validationReport.videoWidth else widthOut,
+                videoHeight = if (validationReport.videoHeight > 0) validationReport.videoHeight else heightOut,
+                videoEncoderName = videoEncName,
+                audioEncoderName = audioEncName,
+                mp4FileSizeBytes = validationReport.fileSizeBytes,
+                usedBitmapFallback = usedBitmapFallback,
+                memory = memorySnapshot,
+                audioSummary = audioSummary,
+                validation = validationReport
+            )
+
+            return timelineEngine.buildSummary(
+                mode = config.timelineMode,
+                usedBitmapFallback = usedBitmapFallback,
+                renderWallDurationMs = wallElapsed,
+                capabilities = bridge.latestCapabilities,
+                audioSummary = audioSummary,
+                diagnostics = diagnostics
+            )
+        } catch (c: CancellationException) {
+            throw c
+        } catch (e: RenderPipelineException) {
+            throw e
+        } catch (t: Throwable) {
+            throw RenderPipelineException(
+                phase = currentPhase,
+                technicalDetail = "[${deviceProfile.socFamily.displayName}] ${t::class.java.simpleName}: ${t.localizedMessage ?: "error tanpa detail"}",
+                cause = t
+            )
         } finally {
             bridge.isCapturingAudio = false
             withContext(Dispatchers.Main) {
@@ -453,6 +711,7 @@ class WebViewOffscreenRenderer(
         muteAudioAtBrowser: Boolean,
         requireUserGesture: Boolean,
         documentStartScript: String?,
+        onFatalError: ((String) -> Unit)? = null,
         onFinished: () -> Unit
     ): WebView {
         return WebView(hostContext).apply {
@@ -491,6 +750,31 @@ class WebViewOffscreenRenderer(
                     request: WebResourceRequest
                 ): WebResourceResponse? {
                     return resourceHandler.handleRequest(request) ?: super.shouldInterceptRequest(view, request)
+                }
+
+                override fun onReceivedError(
+                    view: WebView?,
+                    request: WebResourceRequest?,
+                    error: WebResourceError?
+                ) {
+                    super.onReceivedError(view, request, error)
+                    if (request?.isForMainFrame == true) {
+                        val code = error?.errorCode ?: -1
+                        val desc = error?.description?.toString() ?: "Main frame error"
+                        onFatalError?.invoke("WebView main-frame error ($code): $desc")
+                    }
+                }
+
+                override fun onRenderProcessGone(
+                    view: WebView?,
+                    detail: RenderProcessGoneDetail?
+                ): Boolean {
+                    val crashed = detail?.didCrash() == true
+                    onFatalError?.invoke(
+                        if (crashed) "Proses renderer WebView crash saat rendering."
+                        else "Proses renderer WebView dihentikan oleh sistem (low memory)."
+                    )
+                    return true
                 }
 
                 override fun onPageFinished(view: WebView?, url: String?) {

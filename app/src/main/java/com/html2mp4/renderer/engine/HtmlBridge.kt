@@ -2,15 +2,23 @@ package com.html2mp4.renderer.engine
 
 import android.util.Base64
 import android.webkit.JavascriptInterface
+import com.html2mp4.renderer.model.AudioSyncSummary
+import com.html2mp4.renderer.model.HtmlAnimationCapabilities
 import com.html2mp4.renderer.model.VideoOrientation
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONObject
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 data class AudioPcmChunk(
     val pcmBytes: ByteArray,
     val sampleRate: Int,
     val channels: Int,
-    val ptsMs: Long
+    val ptsMs: Long,
+    val sequence: Long = 0L
 )
 
 data class HtmlProbeResult(
@@ -22,7 +30,9 @@ data class HtmlProbeResult(
 
 /**
  * Injected as window.AndroidHtml2Mp4 inside the offscreen WebView.
- * Receives auto-detected durations, natural HTML resolution/orientation, and tapped PCM audio frames.
+ * Receives auto-detected durations, natural HTML resolution/orientation, deterministic frame
+ * readiness acknowledgements, page animation capabilities, and sequenced PCM audio frames
+ * with overflow, gap, and format validation telemetry.
  */
 class HtmlBridge(
     private val targetSampleRate: Int,
@@ -32,18 +42,87 @@ class HtmlBridge(
     val playbackStartedDeferred = CompletableDeferred<Unit>()
     val audioChunkQueue = ConcurrentLinkedQueue<AudioPcmChunk>()
 
+    private val framePreparedSignals = ConcurrentHashMap<Int, CompletableDeferred<Unit>>()
+    private val audioQueueLock = Any()
+
+    private val receivedAudioChunks = AtomicLong(0L)
+    private val droppedOverflowChunks = AtomicLong(0L)
+    private val missingSequenceChunks = AtomicLong(0L)
+    private val invalidFormatChunks = AtomicLong(0L)
+    private val adaptedFormatChunks = AtomicLong(0L)
+    private val queuedPeakSize = AtomicInteger(0)
+    private var lastReceivedSeq = -1L
+
+    @Volatile
+    var audioTapEngine: String = "ScriptProcessorNode"
+        private set
+
+    @Volatile
+    var audioTapEngineNote: String? = null
+        private set
+
+    @Volatile
+    var latestCapabilities: HtmlAnimationCapabilities = HtmlAnimationCapabilities()
+        private set
+
     @Volatile
     var captureAudioRequested: Boolean = false
 
     @Volatile
     var isCapturingAudio: Boolean = false
 
+    fun armFramePrepared(frameSeq: Int): CompletableDeferred<Unit> {
+        val deferred = CompletableDeferred<Unit>()
+        framePreparedSignals[frameSeq] = deferred
+        return deferred
+    }
+
+    suspend fun awaitFramePrepared(frameSeq: Int, deferred: CompletableDeferred<Unit>, timeoutMs: Long): Boolean {
+        return try {
+            withTimeoutOrNull(timeoutMs) { deferred.await() } != null
+        } finally {
+            framePreparedSignals.remove(frameSeq)
+        }
+    }
+
+    @JavascriptInterface
+    fun onFramePrepared(frameSeq: Int, capabilitiesJson: String?) {
+        if (!capabilitiesJson.isNullOrBlank()) {
+            parseCapabilities(capabilitiesJson)?.let { latestCapabilities = it }
+        }
+        framePreparedSignals.remove(frameSeq)?.complete(Unit)
+    }
+
+    @JavascriptInterface
+    fun onCapabilitiesDetected(capabilitiesJson: String?) {
+        if (!capabilitiesJson.isNullOrBlank()) {
+            parseCapabilities(capabilitiesJson)?.let { latestCapabilities = it }
+        }
+    }
+
+    @JavascriptInterface
+    fun onAudioEngineStatus(engine: String?, note: String?) {
+        if (!engine.isNullOrBlank()) {
+            audioTapEngine = engine.trim()
+        }
+        if (!note.isNullOrBlank()) {
+            audioTapEngineNote = note.trim()
+        }
+    }
+
     @JavascriptInterface
     fun onPlaybackStarted() {
-        audioChunkQueue.clear()
+        resetAudioQueue()
         isCapturingAudio = captureAudioRequested
         if (!playbackStartedDeferred.isCompleted) {
             playbackStartedDeferred.complete(Unit)
+        }
+    }
+
+    fun resetAudioQueue() {
+        synchronized(audioQueueLock) {
+            audioChunkQueue.clear()
+            lastReceivedSeq = -1L
         }
     }
 
@@ -72,25 +151,102 @@ class HtmlBridge(
 
     @JavascriptInterface
     fun onAudioPcmChunk(base64Int16Pcm: String, sampleRate: Int, channels: Int, ptsMs: Long) {
+        onAudioPcmChunkSeq(base64Int16Pcm, sampleRate, channels, ptsMs, -1L)
+    }
+
+    @JavascriptInterface
+    fun onAudioPcmChunkSeq(base64Int16Pcm: String, sampleRate: Int, channels: Int, ptsMs: Long, seq: Long) {
         if (!isCapturingAudio || base64Int16Pcm.isEmpty()) return
-        // Large bounded queue prevents dropping audio bursts during heavy SVG/Canvas frame draws
-        while (audioChunkQueue.size >= 512) {
-            audioChunkQueue.poll()
+
+        val decoded = runCatching { Base64.decode(base64Int16Pcm, Base64.NO_WRAP) }.getOrNull()
+        if (decoded == null || !AudioPcmMath.isValidPcmFormat(decoded.size, sampleRate, channels)) {
+            invalidFormatChunks.incrementAndGet()
+            return
         }
-        runCatching {
-            val decoded = Base64.decode(base64Int16Pcm, Base64.NO_WRAP)
+
+        if (sampleRate != targetSampleRate || channels != targetChannels) {
+            adaptedFormatChunks.incrementAndGet()
+        }
+
+        receivedAudioChunks.incrementAndGet()
+
+        synchronized(audioQueueLock) {
+            if (seq >= 0L) {
+                val (anomalyCount, nextLastSeq) = AudioPcmMath.evaluateSequenceOrder(lastReceivedSeq, seq)
+                if (anomalyCount > 0L) {
+                    missingSequenceChunks.addAndGet(anomalyCount)
+                }
+                lastReceivedSeq = nextLastSeq
+            }
+
+            while (audioChunkQueue.size >= MAX_AUDIO_QUEUE_CHUNKS) {
+                if (audioChunkQueue.poll() != null) {
+                    droppedOverflowChunks.incrementAndGet()
+                } else {
+                    break
+                }
+            }
+
             audioChunkQueue.add(
                 AudioPcmChunk(
                     pcmBytes = decoded,
-                    sampleRate = sampleRate.takeIf { it > 0 } ?: targetSampleRate,
-                    channels = channels.takeIf { it in 1..2 } ?: targetChannels,
-                    ptsMs = ptsMs.coerceAtLeast(0L)
+                    sampleRate = sampleRate,
+                    channels = channels,
+                    ptsMs = ptsMs.coerceAtLeast(0L),
+                    sequence = if (seq >= 0L) seq else receivedAudioChunks.get()
                 )
             )
+            val currentSize = audioChunkQueue.size
+            if (currentSize > queuedPeakSize.get()) {
+                queuedPeakSize.set(currentSize)
+            }
         }
     }
 
+    fun buildAudioSyncSummary(pipeline: MediaCodecMuxerPipeline, isMuted: Boolean): AudioSyncSummary {
+        return AudioSyncSummary(
+            tapEngine = if (isMuted) "Muted" else audioTapEngine,
+            tapEngineNote = if (isMuted) null else audioTapEngineNote,
+            receivedChunks = receivedAudioChunks.get(),
+            droppedOverflowChunks = droppedOverflowChunks.get(),
+            missingSequenceChunks = missingSequenceChunks.get(),
+            invalidFormatChunks = invalidFormatChunks.get(),
+            adaptedFormatChunks = adaptedFormatChunks.get(),
+            queuedPeakSize = queuedPeakSize.get(),
+            targetSampleRateHz = targetSampleRate,
+            targetChannels = targetChannels,
+            gapSilencesInserted = pipeline.audioGapSilencesInserted,
+            silencePaddedMs = pipeline.audioSilencePaddedMs,
+            maxAvDriftMs = pipeline.maxAbsAvDriftMs,
+            finalAvDriftMs = pipeline.finalAvDriftMs
+        )
+    }
+
+    private fun parseCapabilities(raw: String): HtmlAnimationCapabilities? = runCatching {
+        val obj = JSONObject(raw)
+        val hasWebAudio = obj.optBoolean("hasWebAudio", false)
+        val hasMedia = obj.optBoolean("hasMedia", false)
+        val hasCrossOrigin = obj.optBoolean("hasCrossOriginIframes", false)
+        val notes = buildList {
+            if (hasWebAudio) add("Web Audio API berjalan pada audio clock real-time, tidak di-step per frame.")
+            if (hasMedia) add("Elemen <video>/<audio> di-seek per frame dalam mode deterministik.")
+            if (hasCrossOrigin) add("Iframe cross-origin tidak dapat dikontrol oleh virtual clock.")
+        }
+        HtmlAnimationCapabilities(
+            usesRaf = obj.optBoolean("usesRaf", false),
+            usesWebAnimationsOrCss = obj.optBoolean("usesWaapi", false),
+            usesTimers = obj.optBoolean("usesTimers", false),
+            usesGsapOrOpener = obj.optBoolean("usesGsap", false),
+            hasMediaElements = hasMedia,
+            hasWebAudio = hasWebAudio,
+            hasCrossOriginIframes = hasCrossOrigin,
+            notes = notes
+        )
+    }.getOrNull()
+
     companion object {
+        const val MAX_AUDIO_QUEUE_CHUNKS = 1024
+
         /**
          * Document-start probe script used during HTML import.
          * Silences AudioContext immediately and exposes window.__html2mp4ProbeNow() to detect
@@ -366,15 +522,40 @@ class HtmlBridge(
               }
 
               const allContexts = [];
+              window.__html2mp4AudioCtxCount = 0;
               if (CAPTURE_AUDIO && (window.AudioContext || window.webkitAudioContext)) {
                 const NativeCtx = window.AudioContext || window.webkitAudioContext;
                 const hookedContexts = new Set();
                 const hookedElements = new WeakSet();
+                let audioChunkSeq = 0;
+                let reportedEngine = false;
+
+                function emitAudioPcm(int16Buffer, sampleRate, channels, ptsMs) {
+                  if (!window.__html2mp4Active || !window.AndroidHtml2Mp4) return;
+                  const b64 = arrayBufferToBase64(int16Buffer);
+                  const seq = audioChunkSeq++;
+                  if (typeof window.AndroidHtml2Mp4.onAudioPcmChunkSeq === 'function') {
+                    window.AndroidHtml2Mp4.onAudioPcmChunkSeq(b64, sampleRate, channels, ptsMs, seq);
+                  } else if (typeof window.AndroidHtml2Mp4.onAudioPcmChunk === 'function') {
+                    window.AndroidHtml2Mp4.onAudioPcmChunk(b64, sampleRate, channels, ptsMs);
+                  }
+                }
+
+                function reportEngineStatus(name, note) {
+                  if (reportedEngine && name !== 'AudioWorklet') return;
+                  reportedEngine = true;
+                  try {
+                    if (window.AndroidHtml2Mp4 && typeof window.AndroidHtml2Mp4.onAudioEngineStatus === 'function') {
+                      window.AndroidHtml2Mp4.onAudioEngineStatus(name, note);
+                    }
+                  } catch (e) {}
+                }
 
                 function attachTap(ctx) {
                   if (!ctx || hookedContexts.has(ctx)) return;
                   hookedContexts.add(ctx);
                   allContexts.push(ctx);
+                  window.__html2mp4AudioCtxCount = allContexts.length;
                   try {
                     const tapGain = ctx.createGain();
                     // 4096 buffer gives Chromium main thread 2x headroom (~85ms) preventing SVG/DOM underrun crackle
@@ -382,10 +563,13 @@ class HtmlBridge(
                     const silentOut = ctx.createGain();
                     silentOut.gain.value = 0.0;
                     silentOut.__isHtml2Mp4Silent = true;
-                    const startWall = performance.now();
+                    ctx.__html2mp4StartTimeSec = (typeof ctx.currentTime === 'number') ? ctx.currentTime : 0;
+
+                    let workletActive = false;
+                    let workletNode = null;
 
                     processor.onaudioprocess = function(ev) {
-                      if (!window.__html2mp4Active) return;
+                      if (!window.__html2mp4Active || workletActive) return;
                       const srcRate = ctx.sampleRate || TARGET_SR;
                       const inLen = ev.inputBuffer.length;
                       const chCount = Math.min(TARGET_CH, ev.inputBuffer.numberOfChannels);
@@ -421,15 +605,8 @@ class HtmlBridge(
                         }
                       }
 
-                      const ptsMs = Math.max(0, Math.round(performance.now() - startWall));
-                      if (window.AndroidHtml2Mp4) {
-                        window.AndroidHtml2Mp4.onAudioPcmChunk(
-                          arrayBufferToBase64(int16.buffer),
-                          TARGET_SR,
-                          TARGET_CH,
-                          ptsMs
-                        );
-                      }
+                      const audioElapsedMs = Math.max(0, Math.round(((ctx.currentTime || 0) - (ctx.__html2mp4StartTimeSec || 0)) * 1000));
+                      emitAudioPcm(int16.buffer, TARGET_SR, TARGET_CH, audioElapsedMs);
                     };
 
                     tapGain.__isHtml2Mp4Tap = true;
@@ -438,6 +615,83 @@ class HtmlBridge(
                     processor.connect(silentOut);
                     silentOut.connect(ctx.destination);
                     ctx.__html2mp4Tap = tapGain;
+                    reportEngineStatus('ScriptProcessorNode', 'Active synchronous PCM tap (4096 frames)');
+
+                    // Evaluate AudioWorklet safely; upgrades live only if WebView & CSP allow Blob Worklet
+                    if (ctx.audioWorklet && typeof AudioWorkletNode === 'function' && typeof Blob === 'function' && window.URL && typeof window.URL.createObjectURL === 'function') {
+                      try {
+                        const workletCode =
+                          'class Html2Mp4TapProcessor extends AudioWorkletProcessor {\n' +
+                          '  constructor(opts) {\n' +
+                          '    super();\n' +
+                          '    this.ch = (opts && opts.processorOptions && opts.processorOptions.ch) || 2;\n' +
+                          '    this.blockSize = 2048;\n' +
+                          '    this.acc = new Int16Array(this.blockSize * this.ch);\n' +
+                          '    this.fill = 0;\n' +
+                          '    this.blockStartTimeSec = -1;\n' +
+                          '  }\n' +
+                          '  process(inputs) {\n' +
+                          '    const input = inputs[0];\n' +
+                          '    if (!input || !input.length) return true;\n' +
+                          '    const frames = input[0].length;\n' +
+                          '    if (this.blockStartTimeSec < 0) this.blockStartTimeSec = currentTime;\n' +
+                          '    for (let i = 0; i < frames; i++) {\n' +
+                          '      for (let c = 0; c < this.ch; c++) {\n' +
+                          '        const srcCh = c < input.length ? c : 0;\n' +
+                          '        const s = input[srcCh][i] || 0;\n' +
+                          '        const cl = s > 1 ? 1 : (s < -1 ? -1 : s);\n' +
+                          '        this.acc[this.fill * this.ch + c] = cl < 0 ? cl * 0x8000 : cl * 0x7FFF;\n' +
+                          '      }\n' +
+                          '      this.fill++;\n' +
+                          '      if (this.fill >= this.blockSize) {\n' +
+                          '        const out = this.acc.slice(0, this.fill * this.ch);\n' +
+                          '        this.port.postMessage({ buf: out.buffer, sr: sampleRate, ch: this.ch, timeSec: this.blockStartTimeSec }, [out.buffer]);\n' +
+                          '        this.fill = 0;\n' +
+                          '        this.blockStartTimeSec = currentTime;\n' +
+                          '      }\n' +
+                          '    }\n' +
+                          '    return true;\n' +
+                          '  }\n' +
+                          '}\n' +
+                          'registerProcessor("html2mp4-pcm-tap", Html2Mp4TapProcessor);';
+                        const blob = new Blob([workletCode], { type: 'application/javascript' });
+                        const blobUrl = window.URL.createObjectURL(blob);
+                        ctx.audioWorklet.addModule(blobUrl).then(function() {
+                          try { window.URL.revokeObjectURL(blobUrl); } catch (e) {}
+                          try {
+                            workletNode = new AudioWorkletNode(ctx, 'html2mp4-pcm-tap', {
+                              numberOfInputs: 1,
+                              numberOfOutputs: 1,
+                              channelCount: TARGET_CH,
+                              outputChannelCount: [TARGET_CH],
+                              processorOptions: { ch: TARGET_CH }
+                            });
+                            workletNode.__isHtml2Mp4Tap = true;
+                            workletNode.port.onmessage = function(evt) {
+                              if (!window.__html2mp4Active || !evt.data || !evt.data.buf) return;
+                              if (!workletActive) {
+                                workletActive = true;
+                                try { processor.disconnect(); } catch (e) {}
+                                reportEngineStatus('AudioWorklet', 'AudioWorkletNode aktif via Blob worklet thread');
+                              }
+                              const rawTime = Number(evt.data.timeSec);
+                              const baseSec = ctx.__html2mp4StartTimeSec || 0;
+                              const audioElapsedMs = Math.max(0, Math.round((rawTime - baseSec) * 1000));
+                              emitAudioPcm(evt.data.buf, evt.data.sr || (ctx.sampleRate || TARGET_SR), evt.data.ch || TARGET_CH, audioElapsedMs);
+                            };
+                            tapGain.connect(workletNode);
+                            workletNode.connect(silentOut);
+                          } catch (nodeErr) {
+                            reportEngineStatus('ScriptProcessorNode', 'AudioWorkletNode gagal, bertahan di ScriptProcessorNode');
+                          }
+                        }).catch(function() {
+                          try { window.URL.revokeObjectURL(blobUrl); } catch (e) {}
+                          reportEngineStatus('ScriptProcessorNode', 'AudioWorklet ditolak CSP/WebView, fallback ScriptProcessorNode');
+                        });
+                      } catch (awErr) {
+                        reportEngineStatus('ScriptProcessorNode', 'AudioWorklet unavailable, fallback ScriptProcessorNode');
+                      }
+                    }
                   } catch (e) {}
                 }
 
@@ -478,6 +732,7 @@ class HtmlBridge(
                 if (window.__html2mp4HookMediaElements) window.__html2mp4HookMediaElements();
                 allContexts.forEach((c) => {
                   try {
+                    c.__html2mp4StartTimeSec = (typeof c.currentTime === 'number') ? c.currentTime : 0;
                     if (c.state === 'suspended') c.resume().catch(() => {});
                   } catch (e) {}
                 });
@@ -547,6 +802,8 @@ class HtmlBridge(
               };
 
               window.__html2mp4PrepareAndStart = function() {
+                const realSetTimeout = window.__html2mp4RealSetTimeout || window.setTimeout;
+                const realRaf = window.__html2mp4RealRaf || window.requestAnimationFrame;
                 const fontsPromise = (document.fonts && document.fonts.ready)
                   ? document.fonts.ready.catch(() => {})
                   : Promise.resolve();
@@ -556,12 +813,12 @@ class HtmlBridge(
                   return new Promise((res) => {
                     img.addEventListener('load', res, { once: true });
                     img.addEventListener('error', res, { once: true });
-                    setTimeout(res, 600);
+                    realSetTimeout(res, 600);
                   });
                 });
                 Promise.all([fontsPromise, Promise.all(imgs)]).then(function() {
-                  requestAnimationFrame(function() {
-                    requestAnimationFrame(function() {
+                  realRaf(function() {
+                    realRaf(function() {
                       window.__html2mp4StartPlayback();
                       if (window.AndroidHtml2Mp4 && window.AndroidHtml2Mp4.onPlaybackStarted) {
                         window.AndroidHtml2Mp4.onPlaybackStarted();

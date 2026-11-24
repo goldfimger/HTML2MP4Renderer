@@ -79,12 +79,127 @@ data class HtmlProjectMetadata(
     val isDurationAutoDetected: Boolean = false
 )
 
+enum class RenderTimelineMode(val label: String) {
+    DETERMINISTIC("Deterministik (Presisi Frame)"),
+    REALTIME_COMPAT("Kompatibilitas Real-Time (Klasik)")
+}
+
+data class HtmlAnimationCapabilities(
+    val usesRaf: Boolean = false,
+    val usesWebAnimationsOrCss: Boolean = false,
+    val usesTimers: Boolean = false,
+    val usesGsapOrOpener: Boolean = false,
+    val hasMediaElements: Boolean = false,
+    val hasWebAudio: Boolean = false,
+    val hasCrossOriginIframes: Boolean = false,
+    val notes: List<String> = emptyList()
+) {
+    val fullyDeterministicVisuals: Boolean
+        get() = !hasCrossOriginIframes && !hasWebAudio
+}
+
+data class AudioSyncSummary(
+    val tapEngine: String = "ScriptProcessorNode",
+    val tapEngineNote: String? = null,
+    val receivedChunks: Long = 0L,
+    val droppedOverflowChunks: Long = 0L,
+    val missingSequenceChunks: Long = 0L,
+    val invalidFormatChunks: Long = 0L,
+    val adaptedFormatChunks: Long = 0L,
+    val queuedPeakSize: Int = 0,
+    val targetSampleRateHz: Int = 48000,
+    val targetChannels: Int = 2,
+    val gapSilencesInserted: Int = 0,
+    val silencePaddedMs: Long = 0L,
+    val maxAvDriftMs: Long = 0L,
+    val finalAvDriftMs: Long = 0L
+)
+
+enum class RenderPhase(val labelId: String, val labelEn: String) {
+    INITIALIZING("Inisialisasi Pipeline", "Pipeline Initialization"),
+    MEDIA_CODEC_PREPARE("Persiapan Encoder MediaCodec", "MediaCodec Encoder Prepare"),
+    EGL_SURFACE_PREPARE("Persiapan Surface EGL / OpenGL", "EGL / OpenGL Surface Prepare"),
+    WEBVIEW_LOAD("Memuat HTML di WebView", "Loading HTML in WebView"),
+    FRAME_CAPTURE("Pengambilan & Encoding Frame", "Frame Capture & Encoding"),
+    AUDIO_MUXING("Sinkronisasi & Encoding Audio", "Audio Sync & Encoding"),
+    MP4_FINALIZE("Finalisasi Muxer MP4", "MP4 Muxer Finalization"),
+    MP4_VALIDATION("Validasi Track & Durasi MP4", "MP4 Track & Duration Validation"),
+    OUTPUT_SAVE("Menyimpan MP4 ke Penyimpanan", "Saving MP4 to Storage")
+}
+
+class RenderPipelineException(
+    val phase: RenderPhase,
+    val technicalDetail: String?,
+    cause: Throwable? = null
+) : RuntimeException(technicalDetail ?: phase.labelId, cause)
+
+data class MemoryDiagnostics(
+    val peakUsedRamMb: Long = 0L,
+    val minAvailableRamMb: Long = 0L,
+    val lowMemoryThrottleCount: Int = 0
+)
+
+data class Mp4ValidationReport(
+    val fileExists: Boolean = false,
+    val fileSizeBytes: Long = 0L,
+    val hasVideoTrack: Boolean = false,
+    val hasAudioTrack: Boolean = false,
+    val audioExpected: Boolean = true,
+    val videoMime: String? = null,
+    val audioMime: String? = null,
+    val videoWidth: Int = 0,
+    val videoHeight: Int = 0,
+    val measuredFps: Float = 0f,
+    val actualDurationMs: Long = 0L,
+    val expectedDurationMs: Long = 0L,
+    val durationDeltaMs: Long = 0L,
+    val audioSampleRateHz: Int = 0,
+    val audioChannels: Int = 0,
+    val firstKeyFrameDecoded: Boolean = false,
+    val isPlayable: Boolean = false,
+    val warnings: List<String> = emptyList()
+)
+
+data class RenderDiagnosticsReport(
+    val timelineMode: RenderTimelineMode = RenderTimelineMode.DETERMINISTIC,
+    val targetFps: Int = 30,
+    val expectedFrames: Int = 0,
+    val submittedFrames: Int = 0,
+    val repeatedFrames: Int = 0,
+    val droppedOrFailedFrames: Int = 0,
+    val renderWallDurationMs: Long = 0L,
+    val videoWidth: Int = 1280,
+    val videoHeight: Int = 720,
+    val videoEncoderName: String = "Hardware MediaCodec",
+    val audioEncoderName: String = "AAC-LC",
+    val mp4FileSizeBytes: Long = 0L,
+    val usedBitmapFallback: Boolean = false,
+    val memory: MemoryDiagnostics = MemoryDiagnostics(),
+    val audioSummary: AudioSyncSummary? = null,
+    val validation: Mp4ValidationReport? = null
+)
+
+data class RenderTimelineSummary(
+    val timelineMode: RenderTimelineMode = RenderTimelineMode.DETERMINISTIC,
+    val targetFps: Int = 30,
+    val expectedFrames: Int = 0,
+    val submittedFrames: Int = 0,
+    val repeatedFrames: Int = 0,
+    val droppedOrFailedFrames: Int = 0,
+    val usedBitmapFallback: Boolean = false,
+    val renderWallDurationMs: Long = 0L,
+    val capabilities: HtmlAnimationCapabilities = HtmlAnimationCapabilities(),
+    val audioSummary: AudioSyncSummary? = null,
+    val diagnostics: RenderDiagnosticsReport? = null
+)
+
 data class RenderConfig(
     val orientation: VideoOrientation = VideoOrientation.LANDSCAPE,
     val resolutionPreset: ResolutionPreset = ResolutionPreset.P720,
     val customWidth: Int = 1280,
     val customHeight: Int = 720,
     val frameRate: FrameRateOption = FrameRateOption.FPS_30,
+    val timelineMode: RenderTimelineMode = RenderTimelineMode.DETERMINISTIC,
     val videoCodec: VideoCodecOption = VideoCodecOption.H264,
     val bitratePreset: VideoBitratePreset = VideoBitratePreset.AUTO,
     val customBitrateKbps: Int = 6000,
@@ -147,9 +262,18 @@ sealed interface RenderStatus {
         val elapsedMs: Long,
         val phaseLabel: String
     ) : RenderStatus
-    data class Completed(val outputUri: Uri, val fileName: String, val durationMs: Long) : RenderStatus
+    data class Completed(
+        val outputUri: Uri,
+        val fileName: String,
+        val durationMs: Long,
+        val timelineSummary: RenderTimelineSummary? = null
+    ) : RenderStatus
     data class Cancelled(val reason: String) : RenderStatus
-    data class Failed(val errorMessage: String) : RenderStatus
+    data class Failed(
+        val errorMessage: String,
+        val failedPhase: RenderPhase? = null,
+        val technicalDetail: String? = null
+    ) : RenderStatus
 }
 
 data class RenderedVideoItem(

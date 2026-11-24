@@ -83,5 +83,6 @@ dependencies {
     implementation(libs.androidx.webkit)
     implementation(libs.kotlinx.coroutines.android)
 
+    testImplementation(libs.junit)
     debugImplementation(libs.androidx.compose.ui.tooling)
 }

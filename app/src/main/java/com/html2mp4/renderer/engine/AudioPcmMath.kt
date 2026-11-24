@@ -37,6 +37,20 @@ object AudioPcmMath {
         return (relSourceMs - writtenMs).coerceAtMost(maxCapMs)
     }
 
+    fun computeMaxSampleFrames(targetDurationMs: Long, sampleRate: Int): Long {
+        if (targetDurationMs !in 1L until 3_600_000_000L) return Long.MAX_VALUE
+        val safeRate = sampleRate.coerceIn(8_000, 192_000).toLong()
+        return (targetDurationMs * safeRate) / 1_000L
+    }
+
+    fun trimPcmToMaxFrames(pcmBytes: ByteArray, channels: Int, maxFrames: Long): ByteArray {
+        if (maxFrames <= 0L || pcmBytes.isEmpty()) return ByteArray(0)
+        val frameBytes = 2 * channels.coerceIn(1, 2)
+        val availableFrames = (pcmBytes.size / frameBytes).toLong()
+        if (availableFrames <= maxFrames) return pcmBytes
+        return pcmBytes.copyOf((maxFrames * frameBytes).toInt())
+    }
+
     fun adaptPcmToTarget(
         srcBytes: ByteArray,
         srcRate: Int,

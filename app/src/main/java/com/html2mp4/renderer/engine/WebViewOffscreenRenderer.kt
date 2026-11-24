@@ -141,7 +141,7 @@ class WebViewOffscreenRenderer(
             captureAudioRequested = !config.isAudioMuted
         }
         val resourceHandler = SafWebResourceHandler(context, htmlUri, assetsTreeUri)
-        val pipeline = MediaCodecMuxerPipeline(config, deviceProfile, tempOutputFile)
+        val pipeline = MediaCodecMuxerPipeline(config, deviceProfile, tempOutputFile, targetDurationMs = durationMs)
         val eglRenderer = EglSurfaceRenderer()
         val pageLoaded = CompletableDeferred<Unit>()
         val fatalWebViewError = AtomicReference<String?>(null)
@@ -438,20 +438,26 @@ class WebViewOffscreenRenderer(
                     pipeline.drainVideo(endOfStream = false)
 
                     if (!config.isAudioMuted) {
-                        while (true) {
+                        while (!pipeline.isAudioTargetReached()) {
                             val chunk = bridge.audioChunkQueue.poll() ?: break
                             hasReceivedRealAudio = true
                             pipeline.feedAudioChunk(chunk)
                         }
-                        val targetAudioMs = ((tick.frameIndex + 1).toLong() * 1000L) / fps.toLong()
-                        if (!hasReceivedRealAudio && targetAudioMs > 400L) {
-                            var padGuard = 0
-                            while (pipeline.audioWrittenDurationMs() + 200L < targetAudioMs && padGuard < 4) {
-                                pipeline.feedSilencePadding(silenceFrameBytes)
-                                padGuard++
+                        if (pipeline.isAudioTargetReached()) {
+                            bridge.isCapturingAudio = false
+                            bridge.audioChunkQueue.clear()
+                        } else {
+                            val targetAudioMs = ((tick.frameIndex + 1).toLong() * 1000L) / fps.toLong()
+                            if (!hasReceivedRealAudio && targetAudioMs > 400L) {
+                                var padGuard = 0
+                                while (!pipeline.isAudioTargetReached() &&
+                                    pipeline.audioWrittenDurationMs() + 200L < targetAudioMs &&
+                                    padGuard < 4
+                                ) {
+                                    pipeline.feedSilencePadding(silenceFrameBytes)
+                                    padGuard++
+                                }
                             }
-                        } else if (hasReceivedRealAudio) {
-                            pipeline.sampleAvDrift(targetAudioMs)
                         }
                     }
 
@@ -551,19 +557,23 @@ class WebViewOffscreenRenderer(
 
                     val afterFrameElapsedMs = System.currentTimeMillis() - startWallMs
                     if (!config.isAudioMuted) {
-                        while (true) {
+                        while (!pipeline.isAudioTargetReached()) {
                             val chunk = bridge.audioChunkQueue.poll() ?: break
                             hasReceivedRealAudio = true
                             pipeline.feedAudioChunk(chunk)
                         }
-                        if (!hasReceivedRealAudio && afterFrameElapsedMs > 600L) {
+                        if (pipeline.isAudioTargetReached()) {
+                            bridge.isCapturingAudio = false
+                            bridge.audioChunkQueue.clear()
+                        } else if (!hasReceivedRealAudio && afterFrameElapsedMs > 600L) {
                             var padGuard = 0
-                            while (pipeline.audioWrittenDurationMs() + 250L < afterFrameElapsedMs && padGuard < 4) {
+                            while (!pipeline.isAudioTargetReached() &&
+                                pipeline.audioWrittenDurationMs() + 250L < afterFrameElapsedMs &&
+                                padGuard < 4
+                            ) {
                                 pipeline.feedSilencePadding(silenceFrameBytes)
                                 padGuard++
                             }
-                        } else if (hasReceivedRealAudio) {
-                            pipeline.sampleAvDrift(afterFrameElapsedMs)
                         }
                     }
 
@@ -593,19 +603,23 @@ class WebViewOffscreenRenderer(
             }
 
             if (!config.isAudioMuted) {
-                delay(90L)
-                while (true) {
-                    val chunk = bridge.audioChunkQueue.poll() ?: break
-                    hasReceivedRealAudio = true
-                    pipeline.feedAudioChunk(chunk)
-                }
-                var endPadGuard = 0
-                while (pipeline.audioWrittenDurationMs() + 40L < durationMs && endPadGuard < 32) {
-                    pipeline.feedSilencePadding(silenceFrameBytes)
-                    endPadGuard++
-                }
-                if (hasReceivedRealAudio) {
-                    pipeline.sampleAvDrift(durationMs)
+                if (!pipeline.isAudioTargetReached()) {
+                    delay(90L)
+                    while (!pipeline.isAudioTargetReached()) {
+                        val chunk = bridge.audioChunkQueue.poll() ?: break
+                        hasReceivedRealAudio = true
+                        pipeline.feedAudioChunk(chunk)
+                    }
+                    var endPadGuard = 0
+                    while (!pipeline.isAudioTargetReached() &&
+                        pipeline.audioWrittenDurationMs() + 40L < durationMs &&
+                        endPadGuard < 32
+                    ) {
+                        pipeline.feedSilencePadding(silenceFrameBytes)
+                        endPadGuard++
+                    }
+                } else {
+                    bridge.audioChunkQueue.clear()
                 }
             }
 
@@ -627,6 +641,9 @@ class WebViewOffscreenRenderer(
                 pipeline.finishAudioStream()
             }
             pipeline.drainVideo(endOfStream = true)
+            if (!config.isAudioMuted && hasReceivedRealAudio) {
+                pipeline.sampleFinalTrackDrift()
+            }
             val widthOut = pipeline.encodedWidth
             val heightOut = pipeline.encodedHeight
             val videoEncName = pipeline.activeVideoEncoderName

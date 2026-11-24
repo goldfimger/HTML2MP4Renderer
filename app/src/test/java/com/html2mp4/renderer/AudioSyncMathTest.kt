@@ -54,4 +54,18 @@ class AudioSyncMathTest {
         assertEquals(0, adapted.size % 4)
         assertTrue(adapted.size in 1880..1960)
     }
+
+    @Test
+    fun capsAndTrimsAudioFramesToTargetDuration() {
+        val maxFrames = AudioPcmMath.computeMaxSampleFrames(targetDurationMs = 97_560L, sampleRate = 48_000)
+        assertEquals(4_682_880L, maxFrames)
+
+        // 2048 stereo frames (8192 bytes) capped down to 500 frames -> 2000 bytes
+        val chunk = ByteArray(2048 * 4) { 0x11 }
+        val trimmed = AudioPcmMath.trimPcmToMaxFrames(chunk, channels = 2, maxFrames = 500L)
+        assertEquals(2000, trimmed.size)
+
+        val empty = AudioPcmMath.trimPcmToMaxFrames(chunk, channels = 2, maxFrames = 0L)
+        assertEquals(0, empty.size)
+    }
 }

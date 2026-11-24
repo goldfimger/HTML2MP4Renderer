@@ -236,11 +236,13 @@ data class RenderConfig(
                 VideoBitratePreset.AUTO -> {
                     val pixels = resolvedWidth * resolvedHeight
                     val base = when {
-                        pixels <= 854 * 480 -> 2_200
-                        pixels <= 1280 * 720 -> 4_800
-                        else -> 8_500
+                        pixels <= 854 * 480 -> 1_800
+                        pixels <= 1280 * 720 -> 3_500
+                        else -> 5_500
                     }
-                    if (frameRate == FrameRateOption.FPS_60) (base * 1.35f).toInt() else base
+                    val fpsScaled = if (frameRate == FrameRateOption.FPS_60) (base * 1.35f) else base.toFloat()
+                    val codecScaled = if (videoCodec == VideoCodecOption.H265) (fpsScaled * 0.72f) else fpsScaled
+                    codecScaled.toInt()
                 }
                 VideoBitratePreset.CUSTOM -> customBitrateKbps.coerceIn(500, 25_000)
                 else -> bitratePreset.kbps ?: 5_000

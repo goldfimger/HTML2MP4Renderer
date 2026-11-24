@@ -46,8 +46,13 @@ class MediaCodecMuxerPipeline(
         val info: MediaCodec.BufferInfo
     )
 
+    var encodedWidth: Int = config.resolvedWidth
+        private set
+    var encodedHeight: Int = config.resolvedHeight
+        private set
+
     private val expectAudioTrack = !config.isAudioMuted
-    private val pendingSamples = ArrayList<PendingMuxSample>(128)
+    private val pendingSamples = ArrayList<PendingMuxSample>(256)
     private var totalAudioSamplesWritten = 0L
     private var firstRawVideoPtsUs = -1L
     private var lastVideoPtsUs = -1L
@@ -88,12 +93,6 @@ class MediaCodecMuxerPipeline(
         }
 
         muxer = MediaMuxer(tempOutputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-
-        // Seed 1 tiny silence frame (~21ms) so audioTrackIndex initializes alongside videoTrackIndex
-        if (expectAudioTrack) {
-            val warmupSilence = ByteArray(1024 * 2 * config.audioChannels.count)
-            feedAudioPcm(warmupSilence)
-        }
     }
 
     private fun configureVideoEncoderWithFallback(width: Int, height: Int): MediaCodec {
@@ -103,8 +102,10 @@ class MediaCodecMuxerPipeline(
         } else {
             deviceProfile.preferredAvcEncoder
         }
-        val alignedW = ChipsetOptimizer.alignDimension(width, deviceProfile.widthAlignment)
-        val alignedH = ChipsetOptimizer.alignDimension(height, deviceProfile.heightAlignment)
+        val safeAlignW = maxOf(deviceProfile.widthAlignment, 2)
+        val safeAlignH = maxOf(deviceProfile.heightAlignment, 2)
+        val alignedW = ChipsetOptimizer.alignDimension(width, safeAlignW)
+        val alignedH = ChipsetOptimizer.alignDimension(height, safeAlignH)
 
         if (!preferredName.isNullOrBlank()) {
             val namedAttempt = runCatching {
@@ -113,13 +114,20 @@ class MediaCodecMuxerPipeline(
                     configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
                 }
             }
-            if (namedAttempt.isSuccess) return namedAttempt.getOrThrow()
+            if (namedAttempt.isSuccess) {
+                encodedWidth = alignedW
+                encodedHeight = alignedH
+                return namedAttempt.getOrThrow()
+            }
         }
 
         return try {
             val fmt = createVideoFormat(mime, alignedW, alignedH)
             MediaCodec.createEncoderByType(mime).apply {
                 configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            }.also {
+                encodedWidth = alignedW
+                encodedHeight = alignedH
             }
         } catch (_: Throwable) {
             // Safe fallback to H.264/AVC with 16-px macroblock alignment if custom size/HEVC is rejected
@@ -129,6 +137,9 @@ class MediaCodecMuxerPipeline(
             val fmt = createVideoFormat(fallbackMime, mbW, mbH)
             MediaCodec.createEncoderByType(fallbackMime).apply {
                 configure(fmt, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            }.also {
+                encodedWidth = mbW
+                encodedHeight = mbH
             }
         }
     }
@@ -206,7 +217,7 @@ class MediaCodecMuxerPipeline(
                                 if (muxerStarted) {
                                     videoBufferInfo.presentationTimeUs = normalizedPtsUs
                                     muxer!!.writeSampleData(videoTrackIndex, encodedData, videoBufferInfo)
-                                } else if (pendingSamples.size < 512) {
+                                } else if (pendingSamples.size < 1024) {
                                     val copy = ByteArray(videoBufferInfo.size)
                                     encodedData.get(copy)
                                     val infoCopy = MediaCodec.BufferInfo().apply {
@@ -300,7 +311,7 @@ class MediaCodecMuxerPipeline(
                                 if (muxerStarted) {
                                     audioBufferInfo.presentationTimeUs = normalizedAudioPtsUs
                                     muxer!!.writeSampleData(audioTrackIndex, encodedData, audioBufferInfo)
-                                } else if (pendingSamples.size < 512) {
+                                } else if (pendingSamples.size < 1024) {
                                     val copy = ByteArray(audioBufferInfo.size)
                                     encodedData.get(copy)
                                     val infoCopy = MediaCodec.BufferInfo().apply {

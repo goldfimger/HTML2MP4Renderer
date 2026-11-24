@@ -4,6 +4,8 @@ import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
 import android.graphics.Bitmap
+import android.media.MediaExtractor
+import android.media.MediaFormat
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.Environment
@@ -12,10 +14,12 @@ import android.provider.OpenableColumns
 import androidx.documentfile.provider.DocumentFile
 import com.html2mp4.renderer.model.HtmlProjectMetadata
 import com.html2mp4.renderer.model.RenderedVideoItem
+import com.html2mp4.renderer.model.VideoDetailInfo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileInputStream
+import java.util.Locale
 
 class RenderRepository(private val context: Context) {
 
@@ -162,16 +166,127 @@ class RenderRepository(private val context: Context) {
             results.sortedByDescending { it.dateAddedSec }
         }
 
+    suspend fun probeDetailedVideoInfo(item: RenderedVideoItem): VideoDetailInfo =
+        withContext(Dispatchers.IO) {
+            val retriever = MediaMetadataRetriever()
+            val extractor = MediaExtractor()
+            var w = item.width
+            var h = item.height
+            var dur = item.durationMs
+            var fps = 30f
+            var vCodec = "H.264 / AVC"
+            var vBitrate = 0L
+            var aCodec = "Tidak ada / Muted"
+            var aRate = 0
+            var aCh = 0
+            var aBitrate = 0L
+
+            try {
+                retriever.setDataSource(context, item.uri)
+                w = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_WIDTH)?.toIntOrNull() ?: w
+                h = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_VIDEO_HEIGHT)?.toIntOrNull() ?: h
+                dur = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: dur
+                val br = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toLongOrNull() ?: 0L
+                if (br > 0) vBitrate = br
+                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                    val capRate = retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_CAPTURE_FRAMERATE)?.toFloatOrNull()
+                    if (capRate != null && capRate > 0f) fps = capRate
+                }
+            } catch (_: Exception) {
+            } finally {
+                runCatching { retriever.release() }
+            }
+
+            try {
+                extractor.setDataSource(context, item.uri, null)
+                for (i in 0 until extractor.trackCount) {
+                    val fmt = extractor.getTrackFormat(i)
+                    val mime = fmt.getString(MediaFormat.KEY_MIME) ?: continue
+                    if (mime.startsWith("video/")) {
+                        vCodec = when {
+                            mime.contains("hevc", true) -> "H.265 / HEVC"
+                            mime.contains("avc", true) -> "H.264 / AVC"
+                            mime.contains("vp9", true) -> "VP9"
+                            mime.contains("av01", true) -> "AV1"
+                            else -> mime
+                        }
+                        if (fmt.containsKey(MediaFormat.KEY_FRAME_RATE)) {
+                            fps = fmt.getInteger(MediaFormat.KEY_FRAME_RATE).toFloat().coerceAtLeast(1f)
+                        }
+                        if (fmt.containsKey(MediaFormat.KEY_BIT_RATE)) {
+                            vBitrate = fmt.getInteger(MediaFormat.KEY_BIT_RATE).toLong()
+                        }
+                        if (w <= 0 && fmt.containsKey(MediaFormat.KEY_WIDTH)) w = fmt.getInteger(MediaFormat.KEY_WIDTH)
+                        if (h <= 0 && fmt.containsKey(MediaFormat.KEY_HEIGHT)) h = fmt.getInteger(MediaFormat.KEY_HEIGHT)
+                    } else if (mime.startsWith("audio/")) {
+                        aCodec = when {
+                            mime.contains("mp4a", true) -> "AAC-LC"
+                            mime.contains("mpeg", true) -> "MP3"
+                            mime.contains("opus", true) -> "Opus"
+                            else -> mime
+                        }
+                        if (fmt.containsKey(MediaFormat.KEY_SAMPLE_RATE)) {
+                            aRate = fmt.getInteger(MediaFormat.KEY_SAMPLE_RATE)
+                        }
+                        if (fmt.containsKey(MediaFormat.KEY_CHANNEL_COUNT)) {
+                            aCh = fmt.getInteger(MediaFormat.KEY_CHANNEL_COUNT)
+                        }
+                        if (fmt.containsKey(MediaFormat.KEY_BIT_RATE)) {
+                            aBitrate = fmt.getInteger(MediaFormat.KEY_BIT_RATE).toLong()
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            } finally {
+                runCatching { extractor.release() }
+            }
+
+            fun gcd(a: Int, b: Int): Int = if (b == 0) a else gcd(b, a % b)
+            val ratioLabel = if (w > 0 && h > 0) {
+                val g = gcd(w, h)
+                "${w / g}:${h / g}"
+            } else {
+                "-"
+            }
+            val orientLabel = if (h > w) "Vertikal (Portrait)" else "Lanskap (Landscape)"
+
+            VideoDetailInfo(
+                fileName = item.fileName,
+                uriString = item.uri.toString(),
+                width = w,
+                height = h,
+                aspectRatioLabel = ratioLabel,
+                orientationLabel = orientLabel,
+                durationMs = dur,
+                fps = fps,
+                videoCodec = vCodec,
+                videoBitrateBps = vBitrate,
+                audioCodec = aCodec,
+                audioSampleRateHz = aRate,
+                audioChannels = aCh,
+                audioBitrateBps = aBitrate,
+                fileSizeBytes = item.fileSizeBytes,
+                dateAddedSec = item.dateAddedSec
+            )
+        }
+
+    fun probeSimpleDuration(uri: Uri): Long {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(context, uri)
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 5_000L
+        } catch (_: Exception) {
+            5_000L
+        } finally {
+            runCatching { retriever.release() }
+        }
+    }
+
     suspend fun extractVideoThumbnail(uri: Uri): Bitmap? = withContext(Dispatchers.IO) {
         val retriever = MediaMetadataRetriever()
         try {
             retriever.setDataSource(context, uri)
-            retriever.getScaledFrameAtTime(
-                500_000L,
-                MediaMetadataRetriever.OPTION_CLOSEST_SYNC,
-                320,
-                180
-            )
+            retriever.getFrameAtTime(500_000L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
         } catch (_: Exception) {
             null
         } finally {

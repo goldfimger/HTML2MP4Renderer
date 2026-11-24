@@ -24,16 +24,27 @@ import com.html2mp4.renderer.model.ResolutionPreset
 import com.html2mp4.renderer.model.ThemeMode
 import com.html2mp4.renderer.model.VideoBitratePreset
 import com.html2mp4.renderer.model.VideoCodecOption
+import com.html2mp4.renderer.model.VideoDetailInfo
 import com.html2mp4.renderer.model.VideoOrientation
 import com.html2mp4.renderer.service.RenderForegroundService
 import com.html2mp4.renderer.util.ChipsetOptimizer
 import com.html2mp4.renderer.util.DeviceProfile
 import com.html2mp4.renderer.util.MemoryGuard
+import java.io.File
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+data class AppCacheStats(
+    val webViewBytes: Long = 0L,
+    val tempRenderBytes: Long = 0L,
+    val totalBytes: Long = 0L,
+    val isClearing: Boolean = false
+)
 
 class MainViewModel(application: Application) : AndroidViewModel(application) {
 
@@ -65,10 +76,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private val _thumbnails = MutableStateFlow<Map<Uri, Bitmap?>>(emptyMap())
     val thumbnails: StateFlow<Map<Uri, Bitmap?>> = _thumbnails.asStateFlow()
 
+    private val _selectedVideoInfo = MutableStateFlow<VideoDetailInfo?>(null)
+    val selectedVideoInfo: StateFlow<VideoDetailInfo?> = _selectedVideoInfo.asStateFlow()
+
+    private val _isLoadingVideoInfo = MutableStateFlow(false)
+    val isLoadingVideoInfo: StateFlow<Boolean> = _isLoadingVideoInfo.asStateFlow()
+
+    private val _cacheStats = MutableStateFlow(AppCacheStats())
+    val cacheStats: StateFlow<AppCacheStats> = _cacheStats.asStateFlow()
+
     val renderStatus: StateFlow<RenderStatus> = RenderForegroundService.status
 
     init {
         refreshRenderedVideos()
+        refreshCacheStats()
         viewModelScope.launch {
             renderStatus.collect { status ->
                 if (status is RenderStatus.Completed) {
@@ -305,5 +326,74 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    fun loadVideoInfo(item: RenderedVideoItem) {
+        viewModelScope.launch {
+            _isLoadingVideoInfo.value = true
+            _selectedVideoInfo.value = repository.probeDetailedVideoInfo(item)
+            _isLoadingVideoInfo.value = false
+        }
+    }
+
+    fun dismissVideoInfo() {
+        _selectedVideoInfo.value = null
+        _isLoadingVideoInfo.value = false
+    }
+
     fun availableRamMb(): Long = memoryGuard.availableMemoryMb()
+
+    fun refreshCacheStats() {
+        val ctx = getApplication<Application>()
+        viewModelScope.launch {
+            val stats = withContext(Dispatchers.IO) { computeCacheStats(ctx) }
+            _cacheStats.value = stats
+        }
+    }
+
+    fun clearAppCache() {
+        val ctx = getApplication<Application>()
+        viewModelScope.launch {
+            _cacheStats.update { it.copy(isClearing = true) }
+            withContext(Dispatchers.IO) {
+                deleteDirContents(ctx.cacheDir)
+                deleteDirContents(ctx.codeCacheDir)
+                ctx.externalCacheDir?.let { deleteDirContents(it) }
+                File(ctx.dataDir, "app_webview/Cache").takeIf { it.exists() }?.let { deleteDirContents(it) }
+            }
+            val updated = withContext(Dispatchers.IO) { computeCacheStats(ctx) }
+            _cacheStats.value = updated.copy(isClearing = false)
+        }
+    }
+
+    private fun computeCacheStats(ctx: Context): AppCacheStats {
+        val webViewDir = File(ctx.dataDir, "app_webview")
+        val webViewBytes = dirSizeBytes(webViewDir) + dirSizeBytes(File(ctx.cacheDir, "WebView"))
+        val cacheTotal = dirSizeBytes(ctx.cacheDir) + dirSizeBytes(ctx.codeCacheDir) +
+            (ctx.externalCacheDir?.let { dirSizeBytes(it) } ?: 0L)
+        val tempRenderBytes = (cacheTotal - dirSizeBytes(File(ctx.cacheDir, "WebView"))).coerceAtLeast(0L)
+        return AppCacheStats(
+            webViewBytes = webViewBytes,
+            tempRenderBytes = tempRenderBytes,
+            totalBytes = webViewBytes + tempRenderBytes
+        )
+    }
+
+    private fun dirSizeBytes(file: File?): Long {
+        if (file == null || !file.exists()) return 0L
+        if (file.isFile) return file.length()
+        var sum = 0L
+        file.listFiles()?.forEach { child ->
+            sum += dirSizeBytes(child)
+        }
+        return sum
+    }
+
+    private fun deleteDirContents(dir: File?) {
+        if (dir == null || !dir.exists()) return
+        dir.listFiles()?.forEach { child ->
+            if (child.isDirectory) {
+                deleteDirContents(child)
+            }
+            runCatching { child.delete() }
+        }
+    }
 }

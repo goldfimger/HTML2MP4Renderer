@@ -46,6 +46,13 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".VideoEditorActivity"
+            android:exported="false"
+            android:resizeableActivity="true"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|density|keyboard|keyboardHidden|navigation"
+            android:theme="@style/Theme.HTML2MP4Renderer" />
+
         <service
             android:name=".service.RenderForegroundService"
             android:enabled="true"

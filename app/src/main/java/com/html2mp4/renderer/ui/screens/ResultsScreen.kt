@@ -23,17 +23,31 @@ import androidx.compose.foundation.lazy.grid.items as gridItems
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.Info
+import androidx.compose.material.icons.rounded.MoreVert
 import androidx.compose.material.icons.rounded.Movie
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.Share
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ElevatedCard
 import androidx.compose.material3.FilledTonalIconButton
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -43,6 +57,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.html2mp4.renderer.model.RenderedVideoItem
+import com.html2mp4.renderer.model.VideoDetailInfo
 import com.html2mp4.renderer.ui.i18n.AppStrings
 import java.util.Locale
 
@@ -53,7 +68,10 @@ fun ResultsScreen(
     videos: List<RenderedVideoItem>,
     thumbnails: Map<Uri, Bitmap?>,
     onRefresh: () -> Unit,
-    onPlayVideo: (RenderedVideoItem) -> Unit
+    onPlayVideo: (RenderedVideoItem) -> Unit,
+    onEditVideo: (RenderedVideoItem) -> Unit,
+    onShowVideoInfo: (RenderedVideoItem) -> Unit,
+    onShareVideo: (RenderedVideoItem) -> Unit
 ) {
     Column(modifier = Modifier.fillMaxSize()) {
         Row(
@@ -110,7 +128,10 @@ fun ResultsScreen(
                         strings = strings,
                         item = item,
                         thumbnail = thumbnails[item.uri],
-                        onPlay = { onPlayVideo(item) }
+                        onPlay = { onPlayVideo(item) },
+                        onEdit = { onEditVideo(item) },
+                        onInfo = { onShowVideoInfo(item) },
+                        onShare = { onShareVideo(item) }
                     )
                 }
             }
@@ -125,7 +146,10 @@ fun ResultsScreen(
                         strings = strings,
                         item = item,
                         thumbnail = thumbnails[item.uri],
-                        onPlay = { onPlayVideo(item) }
+                        onPlay = { onPlayVideo(item) },
+                        onEdit = { onEditVideo(item) },
+                        onInfo = { onShowVideoInfo(item) },
+                        onShare = { onShareVideo(item) }
                     )
                 }
             }
@@ -138,8 +162,12 @@ private fun RenderedVideoCard(
     strings: AppStrings,
     item: RenderedVideoItem,
     thumbnail: Bitmap?,
-    onPlay: () -> Unit
+    onPlay: () -> Unit,
+    onEdit: () -> Unit,
+    onInfo: () -> Unit,
+    onShare: () -> Unit
 ) {
+    var menuExpanded by remember { mutableStateOf(false) }
     ElevatedCard(
         modifier = Modifier.fillMaxWidth(),
         colors = CardDefaults.elevatedCardColors(
@@ -199,7 +227,112 @@ private fun RenderedVideoCard(
             FilledTonalIconButton(onClick = onPlay) {
                 Icon(Icons.Rounded.PlayArrow, contentDescription = strings.playVideoCd)
             }
+
+            Box {
+                IconButton(onClick = { menuExpanded = true }) {
+                    Icon(Icons.Rounded.MoreVert, contentDescription = strings.moreOptionsCd)
+                }
+                DropdownMenu(
+                    expanded = menuExpanded,
+                    onDismissRequest = { menuExpanded = false }
+                ) {
+                    DropdownMenuItem(
+                        text = { Text(strings.menuEditVideo) },
+                        leadingIcon = { Icon(Icons.Rounded.Edit, contentDescription = null) },
+                        onClick = {
+                            menuExpanded = false
+                            onEdit()
+                        }
+                    )
+                    DropdownMenuItem(
+                        text = { Text(strings.menuVideoInfo) },
+                        leadingIcon = { Icon(Icons.Rounded.Info, contentDescription = null) },
+                        onClick = {
+                            menuExpanded = false
+                            onInfo()
+                        }
+                    )
+                    DropdownMenuItem(
+                        text = { Text(strings.menuShareVideo) },
+                        leadingIcon = { Icon(Icons.Rounded.Share, contentDescription = null) },
+                        onClick = {
+                            menuExpanded = false
+                            onShare()
+                        }
+                    )
+                }
+            }
         }
+    }
+}
+
+@Composable
+fun VideoInfoDialog(
+    strings: AppStrings,
+    info: VideoDetailInfo?,
+    isLoading: Boolean,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(strings.videoInfoTitle, fontWeight = FontWeight.Bold) },
+        text = {
+            if (isLoading && info == null) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp))
+                    Text(strings.loadingInfoLabel, style = MaterialTheme.typography.bodyMedium)
+                }
+            } else if (info != null) {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    InfoRow(strings.infoFileName, info.fileName)
+                    HorizontalDivider()
+                    InfoRow(strings.infoResolution, "${info.width} × ${info.height} px")
+                    InfoRow(strings.infoAspectRatio, info.aspectRatioLabel)
+                    InfoRow(strings.infoOrientation, info.orientationLabel)
+                    InfoRow(strings.infoDuration, formatDuration(info.durationMs))
+                    InfoRow(strings.infoFrameRate, String.format(Locale.US, "%.1f FPS", info.fps))
+                    val vMbps = if (info.videoBitrateBps > 0) {
+                        String.format(Locale.US, "%.2f Mbps", info.videoBitrateBps / 1_000_000.0)
+                    } else "Auto"
+                    InfoRow(strings.infoVideoCodec, "${info.videoCodec} · $vMbps")
+                    val audioSummary = if (info.audioSampleRateHz > 0) {
+                        val aKbps = if (info.audioBitrateBps > 0) "${info.audioBitrateBps / 1000} kbps" else ""
+                        "${info.audioCodec} · ${info.audioSampleRateHz} Hz · ${info.audioChannels}ch $aKbps".trim()
+                    } else {
+                        info.audioCodec
+                    }
+                    InfoRow(strings.infoAudioCodec, audioSummary)
+                    InfoRow(strings.infoFileSize, formatSize(info.fileSizeBytes))
+                    InfoRow(strings.infoUriLocation, info.uriString)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text(strings.closeButton)
+            }
+        }
+    )
+}
+
+@Composable
+private fun InfoRow(label: String, value: String) {
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodySmall,
+            fontWeight = FontWeight.Medium,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis
+        )
     }
 }
 

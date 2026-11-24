@@ -33,10 +33,15 @@ class HtmlBridge(
     val audioChunkQueue = ConcurrentLinkedQueue<AudioPcmChunk>()
 
     @Volatile
+    var captureAudioRequested: Boolean = false
+
+    @Volatile
     var isCapturingAudio: Boolean = false
 
     @JavascriptInterface
     fun onPlaybackStarted() {
+        audioChunkQueue.clear()
+        isCapturingAudio = captureAudioRequested
         if (!playbackStartedDeferred.isCompleted) {
             playbackStartedDeferred.complete(Unit)
         }
@@ -470,11 +475,6 @@ class HtmlBridge(
               }
 
               window.__html2mp4StartPlayback = function() {
-                if (proto && origMediaPlay) {
-                  proto.play = origMediaPlay;
-                }
-                window.__html2mp4Active = true;
-
                 if (window.__html2mp4HookMediaElements) window.__html2mp4HookMediaElements();
                 allContexts.forEach((c) => {
                   try {
@@ -504,6 +504,12 @@ class HtmlBridge(
                 } catch (e) {}
 
                 try {
+                  if (window.gsap && window.gsap.globalTimeline && typeof window.gsap.globalTimeline.restart === 'function') {
+                    window.gsap.globalTimeline.restart(true, false);
+                  }
+                } catch (e) {}
+
+                try {
                   if (window.OPENER && window.OPENER.tl) {
                     if (typeof window.OPENER.tl.pause === 'function') {
                       window.OPENER.tl.pause(0, false);
@@ -514,10 +520,18 @@ class HtmlBridge(
                   }
                 } catch (e) {}
 
+                if (proto && origMediaPlay) {
+                  proto.play = origMediaPlay;
+                }
+                window.__html2mp4Active = true;
+
                 try {
                   window.dispatchEvent(new Event('pointerdown'));
+                  window.dispatchEvent(new Event('mousedown'));
+                  window.dispatchEvent(new Event('mouseup'));
                   if (document.body) {
                     document.body.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+                    document.body.dispatchEvent(new Event('touchstart', { bubbles: true }));
                     document.body.click();
                   }
                 } catch (e) {}
@@ -536,16 +550,24 @@ class HtmlBridge(
                 const fontsPromise = (document.fonts && document.fonts.ready)
                   ? document.fonts.ready.catch(() => {})
                   : Promise.resolve();
-                fontsPromise.then(function() {
-                  // Yield 1 micro-tick so any listener registered in document.fonts.ready runs first
-                  setTimeout(function() {
-                    window.__html2mp4StartPlayback();
+                const imgs = Array.from(document.querySelectorAll('img')).map((img) => {
+                  if (img.complete) return Promise.resolve();
+                  if (typeof img.decode === 'function') return img.decode().catch(() => {});
+                  return new Promise((res) => {
+                    img.addEventListener('load', res, { once: true });
+                    img.addEventListener('error', res, { once: true });
+                    setTimeout(res, 600);
+                  });
+                });
+                Promise.all([fontsPromise, Promise.all(imgs)]).then(function() {
+                  requestAnimationFrame(function() {
                     requestAnimationFrame(function() {
+                      window.__html2mp4StartPlayback();
                       if (window.AndroidHtml2Mp4 && window.AndroidHtml2Mp4.onPlaybackStarted) {
                         window.AndroidHtml2Mp4.onPlaybackStarted();
                       }
                     });
-                  }, 16);
+                  });
                 });
               };
             })();

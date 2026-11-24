@@ -161,3 +161,77 @@ data class RenderedVideoItem(
     val fileSizeBytes: Long,
     val dateAddedSec: Long
 )
+
+data class VideoDetailInfo(
+    val fileName: String,
+    val uriString: String,
+    val width: Int,
+    val height: Int,
+    val aspectRatioLabel: String,
+    val orientationLabel: String,
+    val durationMs: Long,
+    val fps: Float,
+    val videoCodec: String,
+    val videoBitrateBps: Long,
+    val audioCodec: String,
+    val audioSampleRateHz: Int,
+    val audioChannels: Int,
+    val audioBitrateBps: Long,
+    val fileSizeBytes: Long,
+    val dateAddedSec: Long
+)
+
+data class VideoClipSegment(
+    val id: String,
+    val uri: Uri,
+    val label: String,
+    val fullDurationMs: Long,
+    val trimStartMs: Long = 0L,
+    val trimEndMs: Long = fullDurationMs,
+    val laneOffsetMs: Long = 0L
+) {
+    val activeDurationMs: Long
+        get() = (trimEndMs - trimStartMs).coerceAtLeast(100L)
+}
+
+data class AudioClipSegment(
+    val id: String,
+    val uri: Uri,
+    val label: String,
+    val fullDurationMs: Long,
+    val trimStartMs: Long = 0L,
+    val trimEndMs: Long = fullDurationMs,
+    val laneOffsetMs: Long = 0L,
+    val waveformPeaks: List<Float> = emptyList()
+) {
+    val activeDurationMs: Long
+        get() = (trimEndMs - trimStartMs).coerceAtLeast(100L)
+}
+
+data class SmartSyncResult(
+    val recommendedOffsetMs: Long,
+    val firstMotionMs: Long,
+    val firstAudioOnsetMs: Long,
+    val containerSkewMs: Long
+)
+
+data class TextOverlayItem(
+    val id: String,
+    val text: String,
+    val startMs: Long,
+    val endMs: Long,
+    val fontSizeSp: Float = 22f
+)
+
+data class CaptionSegment(
+    val id: String,
+    val text: String,
+    val startMs: Long,
+    val endMs: Long,
+    val languageCode: String = "id"
+)
+
+data class AutoCaptionResult(
+    val captions: List<CaptionSegment>,
+    val detectedLanguage: String
+)

@@ -1,6 +1,8 @@
 package com.html2mp4.renderer
 
 import android.Manifest
+import android.app.Activity
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -56,6 +58,7 @@ import com.html2mp4.renderer.ui.i18n.resolveAppStrings
 import com.html2mp4.renderer.ui.screens.AboutScreen
 import com.html2mp4.renderer.ui.screens.ProjectScreen
 import com.html2mp4.renderer.ui.screens.ResultsScreen
+import com.html2mp4.renderer.ui.screens.VideoInfoDialog
 import com.html2mp4.renderer.ui.theme.Html2Mp4Theme
 import com.html2mp4.renderer.ui.viewmodel.MainViewModel
 
@@ -77,6 +80,9 @@ class MainActivity : ComponentActivity() {
             val renderStatus by vm.renderStatus.collectAsStateWithLifecycle()
             val videos by vm.renderedVideos.collectAsStateWithLifecycle()
             val thumbnails by vm.thumbnails.collectAsStateWithLifecycle()
+            val selectedVideoInfo by vm.selectedVideoInfo.collectAsStateWithLifecycle()
+            val isLoadingVideoInfo by vm.isLoadingVideoInfo.collectAsStateWithLifecycle()
+            val cacheStats by vm.cacheStats.collectAsStateWithLifecycle()
 
             var selectedTab by remember { mutableIntStateOf(0) }
             var playingVideo by remember { mutableStateOf<RenderedVideoItem?>(null) }
@@ -84,6 +90,13 @@ class MainActivity : ComponentActivity() {
             var showSplash by remember { mutableStateOf(true) }
 
             val context = LocalContext.current
+            val videoEditorLauncher = rememberLauncherForActivityResult(
+                ActivityResultContracts.StartActivityForResult()
+            ) { result ->
+                if (result.resultCode == Activity.RESULT_OK) {
+                    vm.refreshRenderedVideos()
+                }
+            }
             val notifPermissionLauncher = rememberLauncherForActivityResult(
                 ActivityResultContracts.RequestPermission()
             ) {}
@@ -262,11 +275,34 @@ class MainActivity : ComponentActivity() {
                                         videos = videos,
                                         thumbnails = thumbnails,
                                         onRefresh = vm::refreshRenderedVideos,
-                                        onPlayVideo = { playingVideo = it }
+                                        onPlayVideo = { playingVideo = it },
+                                        onEditVideo = { item ->
+                                            val intent = Intent(context, VideoEditorActivity::class.java).apply {
+                                                putExtra(VideoEditorActivity.EXTRA_VIDEO_URI, item.uri.toString())
+                                                putExtra(VideoEditorActivity.EXTRA_VIDEO_NAME, item.fileName)
+                                                putExtra(VideoEditorActivity.EXTRA_OUTPUT_TREE_URI, config.outputTreeUri?.toString())
+                                                putExtra(VideoEditorActivity.EXTRA_APP_LANGUAGE, appLanguage.name)
+                                                putExtra(VideoEditorActivity.EXTRA_THEME_MODE, themeMode.name)
+                                            }
+                                            videoEditorLauncher.launch(intent)
+                                        },
+                                        onShowVideoInfo = vm::loadVideoInfo,
+                                        onShareVideo = { item ->
+                                            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                                                type = "video/mp4"
+                                                putExtra(Intent.EXTRA_STREAM, item.uri)
+                                                putExtra(Intent.EXTRA_SUBJECT, item.fileName)
+                                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                            }
+                                            context.startActivity(Intent.createChooser(shareIntent, strings.shareTitle))
+                                        }
                                     )
                                     else -> AboutScreen(
                                         strings = strings,
-                                        deviceProfile = vm.deviceProfile
+                                        deviceProfile = vm.deviceProfile,
+                                        cacheStats = cacheStats,
+                                        onRefreshCache = vm::refreshCacheStats,
+                                        onClearCache = vm::clearAppCache
                                     )
                                 }
                             }
@@ -278,6 +314,15 @@ class MainActivity : ComponentActivity() {
                             strings = strings,
                             video = video,
                             onDismiss = { playingVideo = null }
+                        )
+                    }
+
+                    if (selectedVideoInfo != null || isLoadingVideoInfo) {
+                        VideoInfoDialog(
+                            strings = strings,
+                            info = selectedVideoInfo,
+                            isLoading = isLoadingVideoInfo,
+                            onDismiss = vm::dismissVideoInfo
                         )
                     }
 

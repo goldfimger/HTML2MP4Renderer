@@ -68,7 +68,8 @@ class SafWebResourceHandler(
         val segments = relativePath.split('/').filter { it.isNotBlank() && it != "." }
         for (segment in segments) {
             if (segment == "..") continue
-            current = current.findFile(segment) ?: return null
+            val decoded = Uri.decode(segment)
+            current = current.findFile(decoded) ?: current.findFile(segment) ?: return null
         }
         return current
     }
@@ -84,11 +85,19 @@ class SafWebResourceHandler(
             "png" -> "image/png"
             "jpg", "jpeg" -> "image/jpeg"
             "webp" -> "image/webp"
+            "gif" -> "image/gif"
+            "avif" -> "image/avif"
             "mp4" -> "video/mp4"
             "webm" -> "video/webm"
             "mp3" -> "audio/mpeg"
             "wav" -> "audio/wav"
+            "m4a", "aac" -> "audio/mp4"
+            "ogg" -> "audio/ogg"
             "woff2" -> "font/woff2"
+            "woff" -> "font/woff"
+            "ttf" -> "font/ttf"
+            "otf" -> "font/otf"
+            "wasm" -> "application/wasm"
             else -> MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext) ?: "application/octet-stream"
         }
     }

@@ -3,6 +3,8 @@ package com.html2mp4.renderer.engine
 import android.annotation.SuppressLint
 import android.app.Presentation
 import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.hardware.display.DisplayManager
@@ -120,25 +122,32 @@ class WebViewOffscreenRenderer(
         tempOutputFile: File,
         onProgress: (RenderProgress) -> Unit
     ) {
-        val width = config.resolvedWidth
-        val height = config.resolvedHeight
         val fps = config.frameRate.fps
         val totalFrames = ceil((durationMs / 1000.0) * fps).toInt().coerceAtLeast(fps)
 
         val deviceProfile = ChipsetOptimizer.detect(context)
-        val bridge = HtmlBridge(config.audioSampleRate.hz, config.audioChannels.count)
+        val bridge = HtmlBridge(config.audioSampleRate.hz, config.audioChannels.count).apply {
+            captureAudioRequested = !config.isAudioMuted
+        }
         val resourceHandler = SafWebResourceHandler(context, htmlUri, assetsTreeUri)
         val pipeline = MediaCodecMuxerPipeline(config, deviceProfile, tempOutputFile)
+        val eglRenderer = EglSurfaceRenderer()
         val pageLoaded = CompletableDeferred<Unit>()
 
         var webView: WebView? = null
         var virtualDisplay: VirtualDisplay? = null
         var presentation: Presentation? = null
         var pulseView: View? = null
+        var frameBitmap: Bitmap? = null
+        var bitmapCanvas: Canvas? = null
         var usingPresentation = false
 
         try {
             pipeline.prepare()
+            val width = pipeline.encodedWidth
+            val height = pipeline.encodedHeight
+            eglRenderer.prepare(pipeline.inputSurface, width, height)
+            val oesSurface = eglRenderer.oesInputSurface
 
             withContext(Dispatchers.Main) {
                 runCatching { WebView.enableSlowWholeDocumentDraw() }
@@ -146,17 +155,21 @@ class WebViewOffscreenRenderer(
                 val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
                 val densityDpi = DisplayMetrics.DENSITY_MEDIUM
 
-                val vdAttempt = runCatching {
-                    dm.createVirtualDisplay(
-                        "HTML2MP4_Offscreen",
-                        width,
-                        height,
-                        densityDpi,
-                        pipeline.inputSurface,
-                        DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or
-                            DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION
-                    )
-                }.getOrNull()
+                val vdAttempt = if (oesSurface != null) {
+                    runCatching {
+                        dm.createVirtualDisplay(
+                            "HTML2MP4_Offscreen",
+                            width,
+                            height,
+                            densityDpi,
+                            oesSurface,
+                            DisplayManager.VIRTUAL_DISPLAY_FLAG_OWN_CONTENT_ONLY or
+                                DisplayManager.VIRTUAL_DISPLAY_FLAG_PRESENTATION
+                        )
+                    }.getOrNull()
+                } else {
+                    null
+                }
 
                 val docStartBootstrap = HtmlBridge.buildBootstrapScript(
                     sampleRate = config.audioSampleRate.hz,
@@ -232,7 +245,6 @@ class WebViewOffscreenRenderer(
                 }
 
                 if (!usingPresentation) {
-                    // Crash-free Software Layer fallback drawing directly to MediaCodec Surface
                     webView = createConfiguredWebView(
                         hostContext = context,
                         bridge = bridge,
@@ -259,10 +271,10 @@ class WebViewOffscreenRenderer(
             }
 
             withTimeoutOrNull(12_000L) { pageLoaded.await() }
-            delay(120L)
+            delay(150L)
 
-            bridge.audioChunkQueue.clear()
-            bridge.isCapturingAudio = !config.isAudioMuted
+            // Flush any initial loading-stage texture before real playback begins
+            eglRenderer.discardPendingOesFrames()
 
             withContext(Dispatchers.Main) {
                 val bootstrap = HtmlBridge.buildBootstrapScript(
@@ -276,14 +288,20 @@ class WebViewOffscreenRenderer(
                 )
             }
 
-            // Wait until HTML fonts finish loading, media resets to 0.00s, and Frame 0 playback starts
-            withTimeoutOrNull(3_000L) { bridge.playbackStartedDeferred.await() }
+            // Wait until fonts, images, media reset, and Frame 0 playback are armed
+            withTimeoutOrNull(4_000L) { bridge.playbackStartedDeferred.await() }
+            if (!bridge.isCapturingAudio && !config.isAudioMuted) {
+                bridge.audioChunkQueue.clear()
+                bridge.isCapturingAudio = true
+            }
 
+            val frameDurationNs = (1_000_000_000L / fps).coerceAtLeast(16_000_000L)
             val frameDurationMs = (1000L / fps).coerceAtLeast(16L)
-            val startWallMs = System.currentTimeMillis()
             val silenceFrameBytes = ByteArray((config.audioSampleRate.hz / fps) * 2 * config.audioChannels.count)
+
             var hasReceivedRealAudio = false
             var frameIdx = 0
+            val startWallMs = System.currentTimeMillis()
 
             while (coroutineContext.isActive) {
                 val nowElapsedMs = System.currentTimeMillis() - startWallMs
@@ -293,23 +311,52 @@ class WebViewOffscreenRenderer(
                     delay(8L)
                 }
 
-                withContext(Dispatchers.Main) {
-                    val wv = webView ?: return@withContext
-                    if (usingPresentation) {
+                if (usingPresentation) {
+                    withContext(Dispatchers.Main) {
+                        val wv = webView ?: return@withContext
                         pulseView?.let { pv ->
                             pv.alpha = if (frameIdx % 2 == 0) 0.01f else 0.02f
                             pv.invalidate()
                         }
                         wv.invalidate()
-                    } else {
-                        val surfCanvas = pipeline.inputSurface.lockCanvas(null)
-                        try {
-                            surfCanvas.drawColor(Color.WHITE)
-                            wv.draw(surfCanvas)
-                        } finally {
-                            pipeline.inputSurface.unlockCanvasAndPost(surfCanvas)
-                        }
                     }
+
+                    val waitMs = if (frameIdx == 0) 280L else 12L
+                    val ok = eglRenderer.drawOesFrame(frameIdx * frameDurationNs, waitMs = waitMs)
+                    if (!ok && !eglRenderer.hasOesFrames()) {
+                        // Device/ROM blocked VirtualDisplay composition; switch cleanly to Bitmap -> EGL_TEXTURE_2D
+                        usingPresentation = false
+                        withContext(Dispatchers.Main) {
+                            webView?.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+                        }
+                    } else if (ok) {
+                        frameIdx++
+                    }
+                }
+
+                if (!usingPresentation) {
+                    val bmp = frameBitmap ?: Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888).also {
+                        frameBitmap = it
+                        bitmapCanvas = Canvas(it)
+                    }
+                    withContext(Dispatchers.Main) {
+                        val wv = webView ?: return@withContext
+                        val cvs = bitmapCanvas ?: return@withContext
+                        cvs.drawColor(Color.WHITE)
+                        wv.draw(cvs)
+                    }
+                    eglRenderer.drawBitmapFrame(bmp, frameIdx * frameDurationNs)
+                    frameIdx++
+                }
+
+                // Lockstep CFR catch-up: keep Video timeline matched 1:1 with real-time Audio clock
+                val afterDrawMs = System.currentTimeMillis() - startWallMs
+                val expectedFrameIdx = ((afterDrawMs * fps) / 1000L).toInt().coerceAtMost(totalFrames)
+                var catchup = 0
+                while (frameIdx < expectedFrameIdx && catchup < 3) {
+                    if (!eglRenderer.repeatLastFrame(frameIdx * frameDurationNs)) break
+                    frameIdx++
+                    catchup++
                 }
 
                 pipeline.drainVideo(endOfStream = false)
@@ -321,18 +368,16 @@ class WebViewOffscreenRenderer(
                         hasReceivedRealAudio = true
                         pipeline.feedAudioPcm(chunk.pcmBytes)
                     }
-                    // Never inject synthetic silence gaps into an active live audio stream (causes stuttering).
-                    // Only keep track alive with silence if the page genuinely produces zero audio.
-                    if (!hasReceivedRealAudio && afterFrameElapsedMs > 1_000L) {
+                    // Keep audio track valid on completely silent HTML documents without chopping live audio
+                    if (!hasReceivedRealAudio && afterFrameElapsedMs > 600L) {
                         var padGuard = 0
-                        while (pipeline.audioWrittenDurationMs() + 400L < afterFrameElapsedMs && padGuard < 4) {
+                        while (pipeline.audioWrittenDurationMs() + 250L < afterFrameElapsedMs && padGuard < 4) {
                             pipeline.feedAudioPcm(silenceFrameBytes)
                             padGuard++
                         }
                     }
                 }
 
-                frameIdx++
                 val targetNextMs = frameIdx * frameDurationMs
                 val sleepCheckElapsedMs = System.currentTimeMillis() - startWallMs
                 if (targetNextMs > sleepCheckElapsedMs && sleepCheckElapsedMs < durationMs) {
@@ -357,14 +402,13 @@ class WebViewOffscreenRenderer(
             }
 
             if (!config.isAudioMuted) {
-                // Allow the final ScriptProcessor audio callback (~85ms window) to cross the JS bridge
                 delay(90L)
                 while (true) {
                     val chunk = bridge.audioChunkQueue.poll() ?: break
                     pipeline.feedAudioPcm(chunk.pcmBytes)
                 }
                 var endPadGuard = 0
-                while (pipeline.audioWrittenDurationMs() + 60L < durationMs && endPadGuard < 32) {
+                while (pipeline.audioWrittenDurationMs() + 40L < durationMs && endPadGuard < 32) {
                     pipeline.feedAudioPcm(silenceFrameBytes)
                     endPadGuard++
                 }
@@ -394,6 +438,8 @@ class WebViewOffscreenRenderer(
                 runCatching { virtualDisplay?.setSurface(null) }
                 runCatching { virtualDisplay?.release() }
             }
+            runCatching { frameBitmap?.recycle() }
+            eglRenderer.release()
             pipeline.release()
         }
     }
@@ -410,6 +456,9 @@ class WebViewOffscreenRenderer(
         onFinished: () -> Unit
     ): WebView {
         return WebView(hostContext).apply {
+            isVerticalScrollBarEnabled = false
+            isHorizontalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
             setLayerType(
                 if (hardwareLayer) View.LAYER_TYPE_HARDWARE else View.LAYER_TYPE_SOFTWARE,
                 null
@@ -433,6 +482,7 @@ class WebViewOffscreenRenderer(
                 cacheMode = WebSettings.LOAD_NO_CACHE
                 useWideViewPort = true
                 loadWithOverviewMode = true
+                mixedContentMode = WebSettings.MIXED_CONTENT_ALWAYS_ALLOW
             }
             addJavascriptInterface(bridge, "AndroidHtml2Mp4")
             webViewClient = object : WebViewClient() {
